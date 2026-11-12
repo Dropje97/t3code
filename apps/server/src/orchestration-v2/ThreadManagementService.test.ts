@@ -4,6 +4,7 @@ import {
   EnvironmentId,
   MessageId,
   type OrchestrationV2Command,
+  type OrchestrationV2ServerCommand,
   type OrchestrationV2Run,
   type OrchestrationV2ProviderThread,
   ProviderThreadId,
@@ -38,6 +39,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as ReadFixture from "./SendContinuationReads.testkit.ts";
 
 it("stamps authoritative provenance on commands that create threads or messages", () => {
   const command: OrchestrationV2Command = {
@@ -947,4 +949,280 @@ it.effect(
         expect(yield* Queue.size(started)).toBe(0);
       }).pipe(Effect.provide(layerTest));
     }),
+);
+
+const sendReadCases = [
+  ...(["auto", "queue", "steer", "restart"] as const).flatMap((mode) =>
+    [false, true].flatMap((freshContext) =>
+      ["running", "idle"].map((state) => ({
+        name: `${mode}/${freshContext ? "fresh" : "current"}/${state}`,
+        mode,
+        freshContext,
+        state,
+      })),
+    ),
+  ),
+  ...[
+    "queued-without-item",
+    "queued-item",
+    "started-item",
+    "duplicate-items",
+    "equal-ordinal-items",
+    "binary-id-tie",
+    "missing-message",
+    "runless-message",
+    "missing-run",
+    "missing-item",
+    "preflight-race",
+    "concurrent-send",
+    "replayed-send",
+    "archived",
+    "deleted",
+    "wrong-project",
+    "null-attempt",
+    "completed-turn",
+  ].map((state) => ({ name: state, mode: "auto" as const, freshContext: false, state })),
+];
+
+it.effect.each(sendReadCases)(
+  "send reads retain main's result for $name",
+  ({ mode, freshContext, state }) =>
+    Effect.gen(function* () {
+      const fixture = yield* ReadFixture.seed();
+      const { store, threadId, projectId } = fixture;
+      const selected = fixture.run(21, {
+        status: "running",
+        completedAt: null,
+        ...(state === "null-attempt" ? { activeAttemptId: null } : {}),
+      });
+      if (state !== "idle") {
+        const older = fixture.run(20, { status: "running", completedAt: null });
+        yield* fixture.putRun(older);
+        yield* fixture.putTurn(fixture.turn(older, 7, "running"));
+        yield* fixture.putRun(selected);
+        yield* fixture.putTurn(
+          fixture.turn(selected, 8, state === "completed-turn" ? "completed" : "running"),
+        );
+        const newer = fixture.run(22, { status: "running", completedAt: null });
+        yield* fixture.putRun(newer);
+        yield* fixture.putTurn(fixture.turn(newer, 9, "completed"));
+      }
+      if (state === "archived" || state === "deleted") {
+        yield* fixture.putThread({
+          ...fixture.thread,
+          ...(state === "archived" ? { archivedAt: fixture.now } : { deletedAt: fixture.now }),
+        });
+      }
+      const broadPreflight = yield* store.getThreadRecords(threadId, ["runs", "providerTurns"]);
+      const steerable = broadPreflight.runs
+        .filter(
+          (run) =>
+            run.status === "running" &&
+            run.activeAttemptId !== null &&
+            broadPreflight.providerTurns.some(
+              (turn) => turn.runAttemptId === run.activeAttemptId && turn.status === "running",
+            ),
+        )
+        .toSorted((left, right) => right.ordinal - left.ordinal)[0];
+      const effectiveMode =
+        freshContext && (mode === "steer" || mode === "restart") ? "queue" : mode;
+      const messageId = MessageId.make("sent-message");
+      const commands: Array<OrchestrationV2ServerCommand> = [];
+      let dispatched = false;
+      const sentSql = ReadFixture.traceSql();
+      const serviceLayer = ThreadManagementService.layer.pipe(
+        Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            getThreadRecords: (id, fields, filter) =>
+              store.getThreadRecords(id, fields, filter).pipe(Effect.orDie),
+            getSentMessageState: (id, sentMessageId) =>
+              store
+                .getSentMessageState(id, sentMessageId)
+                .pipe(Effect.orDie, Effect.withTracer(sentSql.tracer)),
+            dispatch: (command) =>
+              Effect.gen(function* () {
+                commands.push(command);
+                if (!dispatched) {
+                  dispatched = true;
+                  if (state === "preflight-race") {
+                    yield* fixture.putRun({
+                      ...selected,
+                      status: "completed",
+                      completedAt: fixture.now,
+                    });
+                  }
+                  const delivered = fixture.run(30, {
+                    status: state === "queued-without-item" ? "queued" : "running",
+                    completedAt: null,
+                  });
+                  if (state !== "missing-run") yield* fixture.putRun(delivered);
+                  if (state !== "missing-message") {
+                    yield* fixture.putMessage(
+                      fixture.message(messageId, state === "runless-message" ? null : delivered.id),
+                    );
+                  }
+                  if (state !== "missing-item" && state !== "queued-without-item") {
+                    yield* fixture.putItem(
+                      fixture.item(
+                        "sent-item",
+                        40,
+                        messageId,
+                        delivered.id,
+                        state === "queued-item"
+                          ? "queued_turn"
+                          : state === "started-item"
+                            ? "turn_start"
+                            : "steer",
+                      ),
+                    );
+                  }
+                  if (
+                    state === "duplicate-items" ||
+                    state === "equal-ordinal-items" ||
+                    state === "binary-id-tie"
+                  ) {
+                    // Main selects the first matching item across all runs, including legacy runless items.
+                    yield* fixture.putItem(
+                      fixture.item("z-legacy-item", 0, messageId, fixture.run(2).id, "queued_turn"),
+                    );
+                    yield* fixture.putItem(
+                      fixture.item(
+                        state === "binary-id-tie" ? "ä-legacy-item" : "a-legacy-item",
+                        state === "duplicate-items" ? 1 : 0,
+                        messageId,
+                        null,
+                        "turn_start",
+                      ),
+                    );
+                  }
+                  if (state === "concurrent-send") {
+                    const concurrent = fixture.run(31, { status: "running", completedAt: null });
+                    yield* fixture.putRun(concurrent);
+                    yield* fixture.putMessage(
+                      fixture.message(concurrent.userMessageId, concurrent.id),
+                    );
+                    yield* fixture.putItem(
+                      fixture.item(
+                        "concurrent-item",
+                        41,
+                        concurrent.userMessageId,
+                        concurrent.id,
+                        "turn_start",
+                      ),
+                    );
+                  }
+                }
+                return { sequence: 123, storedEvents: [] };
+              }).pipe(Effect.orDie),
+          }),
+        ),
+        Layer.provide(ServerSettings.layerTest()),
+        Layer.provide(
+          Layer.mock(CommandReceiptStore.CommandReceiptStoreV2)({
+            getByCommandId: () => Effect.succeedNone,
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        const input = {
+          projectId: state === "wrong-project" ? ProjectId.make("other-project") : projectId,
+          threadId,
+          commandId: CommandId.make("send-read-command"),
+          messageId,
+          text: "Send payload",
+          attachments: [],
+          mode,
+          freshContext,
+          createdBy: "agent" as const,
+          creationSource: "mcp" as const,
+        };
+        const outcome = yield* threads.sendToThread(input).pipe(Effect.result);
+        const expectedError =
+          state === "wrong-project" || state === "deleted"
+            ? "ThreadManagementThreadNotFoundError"
+            : state === "archived"
+              ? "ThreadManagementThreadArchivedError"
+              : (effectiveMode === "steer" || effectiveMode === "restart") &&
+                  steerable === undefined
+                ? "ThreadManagementNoSteerableRunError"
+                : ["missing-message", "runless-message", "missing-run", "missing-item"].includes(
+                      state,
+                    )
+                  ? "ThreadManagementDurableRunProjectionError"
+                  : undefined;
+        if (expectedError !== undefined) {
+          expect(outcome._tag).toBe("Failure");
+          if (outcome._tag === "Failure") expect(outcome.failure._tag).toBe(expectedError);
+          return;
+        }
+        expect(outcome._tag).toBe("Success");
+        if (outcome._tag !== "Success") return;
+        const result = outcome.success;
+        const selects = sentSql.queries.filter(({ query }) => /^\s*SELECT\b/i.test(query));
+        expect(selects.length).toBeGreaterThan(0);
+        expect(selects.every(({ transaction }) => transaction !== null)).toBe(true);
+        expect(new Set(selects.map(({ transaction }) => transaction)).size).toBe(1);
+        // The original main read is the result oracle; no optimized-code snapshots are recorded.
+        const broad = yield* store.getThreadRecords(threadId, ["runs", "messages", "turnItems"], {
+          messageIds: [messageId],
+          turnItemTypes: ["user_message"],
+        });
+        const message = broad.messages.find((candidate) => candidate.id === messageId)!;
+        const run = broad.runs.find((candidate) => candidate.id === message.runId)!;
+        const item =
+          broad.turnItems.find(
+            (candidate) => candidate.type === "user_message" && candidate.messageId === messageId,
+          ) ?? null;
+        expect(result.message).toEqual(message);
+        expect(result.run).toEqual(run);
+        expect(result.turnItem).toEqual(item);
+        expect(result.projection.runs).toEqual([run]);
+        expect(result.projection.messages).toEqual([message]);
+        expect(
+          result.projection.turnItems.every(
+            (candidate) => candidate.type === "user_message" && candidate.messageId === messageId,
+          ),
+        ).toBe(true);
+        const expectedDelivery =
+          item === null || (item.type === "user_message" && item.inputIntent === "queued_turn")
+            ? "queued"
+            : item.type === "user_message" && item.inputIntent === "turn_start"
+              ? "started"
+              : effectiveMode === "restart"
+                ? "restarted"
+                : "steered";
+        expect(result.delivery).toBe(expectedDelivery);
+        expect(commands[0]).toMatchObject({
+          type: "message.dispatch",
+          messageId,
+          dispatchMode:
+            effectiveMode === "steer" || effectiveMode === "restart"
+              ? {
+                  type: effectiveMode === "steer" ? "steer_active" : "restart_active",
+                  targetRunId: steerable!.id,
+                }
+              : effectiveMode === "auto" && steerable !== undefined
+                ? { type: "steer_active", targetRunId: steerable.id }
+                : { type: effectiveMode === "queue" ? "queue_after_active" : "start_immediately" },
+          ...(effectiveMode === "auto" ? { deliveryIntent: "auto" } : {}),
+          ...(freshContext ? { freshContext: true } : {}),
+        });
+        if (state === "replayed-send") {
+          const replay = yield* threads.sendToThread(input);
+          expect({
+            message: replay.message,
+            run: replay.run,
+            turnItem: replay.turnItem,
+            delivery: replay.delivery,
+          }).toEqual({
+            message: result.message,
+            run: result.run,
+            turnItem: result.turnItem,
+            delivery: result.delivery,
+          });
+        }
+      }).pipe(Effect.provide(serviceLayer));
+    }).pipe(Effect.provide(ReadFixture.layerDatabase)),
 );

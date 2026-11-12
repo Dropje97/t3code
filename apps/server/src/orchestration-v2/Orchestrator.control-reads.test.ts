@@ -5,6 +5,7 @@ import {
   EventId,
   NodeId,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2ServerCommand,
   PlanId,
   ProjectId,
   ProviderDriverKind,
@@ -1000,6 +1001,82 @@ it.effect("implements a proposed plan that the command projection leaves out", (
   }).pipe(Effect.provide(layerTest)),
 );
 
+it.effect.each([true, false])(
+  "validates a source plan's project without loading its history (same project: %s)",
+  (sameProject) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const sourceThreadId = ThreadId.make("thread:plan-source");
+      const targetThreadId = ThreadId.make("thread:plan-target");
+      const planId = PlanId.make("plan:thin-source");
+      const now = yield* DateTime.now;
+      for (const threadId of [sourceThreadId, targetThreadId]) {
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(`create:${threadId}`),
+          threadId,
+          projectId: ProjectId.make(
+            sameProject || threadId === sourceThreadId ? "project:plan" : "project:other",
+          ),
+          title: "Plan",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "user",
+          creationSource: "web",
+        });
+      }
+      yield* projections.apply({
+        id: EventId.make("event:thin-source-plan"),
+        type: "plan.updated",
+        threadId: sourceThreadId,
+        occurredAt: now,
+        payload: {
+          id: planId,
+          threadId: sourceThreadId,
+          runId: null,
+          nodeId: NodeId.make("node:thin-source-plan"),
+          kind: "proposed_plan",
+          status: "active",
+          markdown: "# Plan\n\nImplement it.",
+        },
+      });
+      // The source's old records need not decode to validate its current project.
+      yield* sql`INSERT INTO orchestration_v2_projection_messages
+        (message_id, thread_id, run_id, node_id, role, streaming, created_at, updated_at, payload_json)
+        VALUES ('obsolete-source-message', ${sourceThreadId}, NULL, NULL, 'user', 0, ${DateTime.formatIso(now)}, ${DateTime.formatIso(now)}, '{}')`;
+      const result = yield* orchestrator
+        .dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("implement-thin-source-plan"),
+          threadId: targetThreadId,
+          messageId: MessageId.make("message:thin-source-plan"),
+          text: "Implement the plan.",
+          attachments: [],
+          sourcePlanRef: { threadId: sourceThreadId, planId },
+          dispatchMode: { type: "defer_start" },
+          createdBy: "user",
+          creationSource: "web",
+        })
+        .pipe(Effect.result);
+      if (sameProject) {
+        assert.isTrue(Result.isSuccess(result));
+        assert.equal((yield* projections.getPlan(sourceThreadId, planId))?.status, "completed");
+      } else {
+        assert.isTrue(Result.isFailure(result));
+        if (Result.isFailure(result)) {
+          assert.instanceOf(result.failure, Orchestrator.OrchestratorDispatchError);
+          assert.include(String(result.failure.cause), "belongs to a different project");
+        }
+        assert.equal((yield* projections.getPlan(sourceThreadId, planId))?.status, "active");
+      }
+    }).pipe(Effect.provide(layerTest)),
+);
+
 it.effect("settles only the stopped run's background work, once", () =>
   Effect.gen(function* () {
     const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -1282,6 +1359,165 @@ it.effect("keeps delegated child pull-request links independent of the parent", 
     assert.deepEqual(parentAfterChildLink.thread.linkedPullRequest, parentPullRequest);
     assert.deepEqual(parentAfterChildLink.thread.pullRequests, parent.thread.pullRequests);
   }).pipe(Effect.provide(layerTest)),
+);
+
+it.effect.each(["run", "request"] as const)(
+  "reads only the question's task cohort (%s event)",
+  (branch) =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const projections = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      const parentThreadId = ThreadId.make("thread:cohort-question-parent");
+      const now = yield* DateTime.now;
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("create-cohort-question-parent"),
+        threadId: parentThreadId,
+        projectId: ProjectId.make("project:cohort-question"),
+        title: "Parent",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: null,
+        createdBy: "user",
+        creationSource: "web",
+      });
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make("start-cohort-question-parent"),
+        threadId: parentThreadId,
+        messageId: MessageId.make("message:cohort-question-parent"),
+        text: "Delegate the research",
+        attachments: [],
+        dispatchMode: { type: "start_immediately" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const parentRun = (yield* projections.getThreadRecords(parentThreadId, ["runs"])).runs[0]!;
+      yield* orchestrator.dispatch({
+        type: "delegated_task.request",
+        commandId: CommandId.make("delegate-cohort-question"),
+        parentThreadId,
+        parentRunId: parentRun.id,
+        parentNodeId: parentRun.rootNodeId!,
+        task: "Research the sources",
+        completionWake: "settled_only",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        createdBy: "agent",
+        creationSource: "mcp",
+      });
+      const task = (yield* projections.getThreadRecords(parentThreadId, ["subagents"]))
+        .subagents[0]!;
+      const childThreadId = task.childThreadId!;
+      const childRun = (yield* projections.getThreadRecords(childThreadId, ["runs"])).runs[0]!;
+      const question = {
+        id: EventId.make("event:cohort-question"),
+        type: "runtime-request.updated",
+        threadId: childThreadId,
+        runId: childRun.id,
+        occurredAt: now,
+        payload: {
+          id: RuntimeRequestId.make("request:cohort-question"),
+          nodeId: childRun.rootNodeId!,
+          providerTurnId: null,
+          nativeRequestRef: null,
+          kind: "user_input",
+          status: "pending",
+          responseCapability: {
+            type: "live",
+            providerSessionId: ProviderSessionId.make("session:cohort-question"),
+          },
+          createdAt: now,
+          resolvedAt: null,
+        },
+      } satisfies OrchestrationV2DomainEvent;
+      yield* projections.apply(question);
+      const parentCompleted = {
+        id: EventId.make("event:cohort-question-parent-completed"),
+        type: "run.updated",
+        threadId: parentThreadId,
+        runId: parentRun.id,
+        occurredAt: now,
+        payload: { ...parentRun, status: "completed", completedAt: now },
+      } satisfies OrchestrationV2DomainEvent;
+      yield* projections.apply(parentCompleted);
+      // Historical tasks outside the selected run/task must never be decoded.
+      for (const runId of [RunId.make("run:other-cohort"), null]) {
+        yield* sql`INSERT INTO orchestration_v2_projection_subagents
+          (subagent_id, thread_id, run_id, parent_node_id, provider, origin, status, updated_at, payload_json)
+          VALUES (${`obsolete:${runId ?? "runless"}`}, ${parentThreadId}, ${runId}, 'node:obsolete', 'codex', 'app_owned', 'running', ${DateTime.formatIso(now)}, '{}')`;
+      }
+      const dispatched: Array<OrchestrationV2ServerCommand> = [];
+      const layerReactor = DelegatedTaskQuestionReactor.layer.pipe(
+        Layer.provide(
+          Layer.mock(Orchestrator.OrchestratorV2)({
+            dispatch: (command) =>
+              Effect.sync(() => {
+                dispatched.push(command);
+                return {} as never;
+              }),
+          }),
+        ),
+      );
+      yield* Effect.gen(function* () {
+        const reactor = yield* DelegatedTaskQuestionReactor.DelegatedTaskQuestionReactor;
+        const cases =
+          branch === "run"
+            ? ([
+                { runId: parentRun.id, status: "running", disposed: false, expected: 1 },
+                { runId: RunId.make("run:other"), status: "running", disposed: false, expected: 0 },
+                { runId: null, status: "running", disposed: false, expected: 0 },
+                { runId: parentRun.id, status: "running", disposed: true, expected: 0 },
+                ...(["completed", "failed", "cancelled", "interrupted"] as const).map((status) => ({
+                  runId: parentRun.id,
+                  status,
+                  disposed: false,
+                  expected: 0,
+                })),
+              ] as const)
+            : ([
+                { runId: parentRun.id, status: "running", disposed: false, expected: 1 },
+                // Legacy tasks without a parent run can still route their own question.
+                { runId: null, status: "running", disposed: false, expected: 1 },
+              ] as const);
+        for (const [index, scenario] of cases.entries()) {
+          yield* projections.apply({
+            id: EventId.make(`event:cohort-question-task:${index}`),
+            type: "subagent.updated",
+            threadId: parentThreadId,
+            occurredAt: now,
+            payload: {
+              ...task,
+              runId: scenario.runId,
+              status: scenario.status,
+              completionDelivery: {
+                state: scenario.disposed ? "disposed" : "pending",
+                observedByRunId: null,
+              },
+            },
+          });
+          const before = dispatched.length;
+          yield* reactor.handle(branch === "run" ? parentCompleted : question);
+          assert.equal(dispatched.length - before, scenario.expected);
+          if (scenario.expected > 0) {
+            const command = dispatched.at(-1)!;
+            assert.equal(command.type, "message.dispatch");
+            if (command.type === "message.dispatch") {
+              assert.deepEqual(command.notification?.source, {
+                kind: "delegated_task",
+                taskIds: [task.id],
+                childThreadId,
+              });
+              assert.include(command.text, `requestId ${question.payload.id}.`);
+            }
+          }
+        }
+      }).pipe(Effect.provide(layerReactor));
+    }).pipe(Effect.provide(layerTest)),
 );
 
 it.effect("wakes the parent once when its delegated task asks a question", () =>

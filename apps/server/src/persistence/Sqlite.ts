@@ -50,10 +50,162 @@ const damagedDatabaseError = (dbPath: string, cause: SqlError.SqlError) =>
     }),
   });
 
+const LOCAL_READ_INDEX_NAMES = [
+  "local_projection_threads_active_updated_idx",
+  "local_projection_threads_pull_requests_guarded_idx",
+  "local_projection_provider_turns_live_idx",
+  "local_projection_turn_items_type_private_idx",
+  "local_projection_message_item_order_guarded_private_idx",
+  "local_projection_threads_limit_wake_guarded_idx",
+  "local_projection_runs_status_private_idx",
+  "local_projection_messages_compact_guarded_private_idx",
+  "local_projection_attempts_live_private_idx",
+  "local_projection_provider_turns_node_private_idx",
+  "local_projection_provider_turns_usage_guarded_private_idx",
+  "local_projection_provider_turns_attempt_private_idx",
+  "local_projection_checkpoints_window_private_idx",
+  "local_projection_subagents_run_private_idx",
+  "local_projection_subagents_routing_private_idx",
+  "local_projection_threads_worktree_guarded_idx",
+] as const;
+const OBSOLETE_LOCAL_SCHEMA_NAMES = [
+  "local_turn_item_counts_insert",
+  "local_turn_item_counts_delete",
+  "local_turn_item_counts_move",
+  "local_turn_item_counts",
+  "local_projection_provider_turns_usage_private_idx",
+  "local_projection_attempts_timeline_metadata_ids_private_idx",
+  "local_projection_message_item_order_idx",
+  "local_projection_message_item_order_private_idx",
+  "local_projection_messages_compact_private_idx",
+  "local_projection_nodes_root_private_idx",
+  "local_projection_nodes_root_status_private_idx",
+  "local_projection_nodes_structural_idx",
+  "local_projection_nodes_thread_root_status_private_idx",
+  "local_projection_run_attempts_latest_private_idx",
+  "local_projection_run_attempts_root_private_idx",
+  "local_projection_runs_completed_private_idx",
+  "local_projection_runs_timeline_metadata_private_idx",
+  "local_projection_subagents_recovery_idx",
+  "local_projection_subagents_recovery_private_idx",
+  "local_projection_threads_limit_wake_idx",
+  "local_projection_threads_limit_wake_private_idx",
+  "local_projection_threads_pull_requests_idx",
+  "local_projection_turn_items_live_idx",
+  "local_projection_turn_items_subagent_private_idx",
+  "local_projection_turn_items_thread_type_idx",
+  "local_projection_turn_items_timeline_private_idx",
+] as const;
+
+const setupLocalReadIndexes = Effect.gen(function* () {
+  const sql = yield* SqlClient.SqlClient;
+  // Local read paths are installed after upstream migrations. Definition changes get new
+  // names because IF NOT EXISTS preserves production's installed definitions. Private partial
+  // indexes use closed-domain sentinels so unmodified upstream queries keep their plans.
+  yield* sql`DROP TRIGGER IF EXISTS local_turn_item_counts_insert`;
+  yield* sql`DROP TRIGGER IF EXISTS local_turn_item_counts_delete`;
+  yield* sql`DROP TRIGGER IF EXISTS local_turn_item_counts_move`;
+  yield* sql`DROP TABLE IF EXISTS local_turn_item_counts`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_provider_turns_usage_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_attempts_timeline_metadata_ids_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_message_item_order_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_message_item_order_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_messages_compact_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_nodes_root_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_nodes_root_status_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_nodes_structural_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_nodes_thread_root_status_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_run_attempts_latest_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_run_attempts_root_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_runs_completed_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_runs_timeline_metadata_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_subagents_recovery_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_subagents_recovery_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_threads_limit_wake_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_threads_limit_wake_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_threads_pull_requests_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_live_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_subagent_private_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_thread_type_idx`;
+  yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_timeline_private_idx`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_threads_active_updated_idx
+  ON orchestration_v2_projection_threads(updated_at, thread_id)
+  WHERE deleted_at IS NULL AND archived_at IS NULL`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_threads_pull_requests_guarded_idx
+  ON orchestration_v2_projection_threads(updated_at, thread_id)
+  WHERE deleted_at IS NULL AND archived_at IS NULL
+    AND CASE WHEN json_valid(payload_json)
+      THEN json_array_length(payload_json, '$.pullRequests') > 0 ELSE 0 END`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_live_idx
+  ON orchestration_v2_projection_provider_turns(thread_id, status, run_attempt_id)
+  WHERE status IN ('pending', 'starting', 'running', 'waiting')`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_turn_items_type_private_idx
+  ON orchestration_v2_projection_turn_items(thread_id, type, ordinal, turn_item_id)
+  WHERE type <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_message_item_order_guarded_private_idx
+  ON orchestration_v2_projection_turn_items(thread_id, (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.messageId') END), ordinal)
+  WHERE type IN ('user_message', 'assistant_message') AND type <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_threads_limit_wake_guarded_idx
+  ON orchestration_v2_projection_threads(
+    (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.limitRecovery.resetAt') END),
+    (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.snoozedUntil') END))
+  WHERE deleted_at IS NULL AND CASE WHEN json_valid(payload_json)
+    THEN json_extract(payload_json, '$.limitRecovery.autoResume') = 1 ELSE 0 END`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_runs_status_private_idx
+  ON orchestration_v2_projection_runs(run_id, status)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_messages_compact_guarded_private_idx
+  ON orchestration_v2_projection_messages(thread_id, lower(trim((CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.text') END),
+    char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200,
+      8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279))))
+  WHERE role = 'user' AND role <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_attempts_live_private_idx
+  ON orchestration_v2_projection_run_attempts(thread_id, root_node_id)
+  WHERE status IN ('pending','starting','running','waiting') AND status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_node_private_idx
+  ON orchestration_v2_projection_provider_turns(thread_id, node_id)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_usage_guarded_private_idx
+  ON orchestration_v2_projection_provider_turns(thread_id,
+    (CASE WHEN json_valid(payload_json)
+      THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
+    provider_thread_id, ordinal)
+  WHERE status <> 'local-index-private' AND (CASE WHEN json_valid(payload_json)
+    THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_attempt_private_idx
+  ON orchestration_v2_projection_provider_turns(thread_id, run_attempt_id, provider_thread_id,
+    ordinal)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_checkpoints_window_private_idx
+  ON orchestration_v2_projection_checkpoints(thread_id, status, run_id, node_id,
+    ordinal_within_scope, checkpoint_id)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_subagents_run_private_idx
+  ON orchestration_v2_projection_subagents(thread_id, run_id)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_subagents_routing_private_idx
+  ON orchestration_v2_projection_subagents(thread_id, status, subagent_id, child_thread_id, provider_thread_id)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_threads_worktree_guarded_idx
+  ON orchestration_v2_projection_threads(thread_id,
+    (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.worktreePath') END))
+  WHERE deleted_at IS NULL
+    AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.worktreePath') END) IS NOT NULL`;
+});
+
 // CLI commands open the server's database from another process; migrating behind its owner changes the schema it runs on.
 const runMigrationsAsOwner = Effect.fn("SqlitePersistence.runMigrationsAsOwner")(function* () {
-  // With nothing pending, runMigrations only validates the recorded history and writes nothing.
-  if (!(yield* hasPendingMigrations())) return yield* runMigrations();
+  const sql = yield* SqlClient.SqlClient;
+  const pendingMigrations = yield* hasPendingMigrations();
+  const installed = yield* sql<{ readonly name: string }>`
+    SELECT name FROM sqlite_schema
+    WHERE name IN ${sql.in([...LOCAL_READ_INDEX_NAMES, ...OBSOLETE_LOCAL_SCHEMA_NAMES])}
+  `;
+  const names = new Set(installed.map((row) => row.name));
+  const localSchemaPending =
+    LOCAL_READ_INDEX_NAMES.some((name) => !names.has(name)) ||
+    OBSOLETE_LOCAL_SCHEMA_NAMES.some((name) => names.has(name));
+  if (!pendingMigrations && !localSchemaPending) return yield* runMigrations();
   const { serverRuntimeStatePath } = yield* ServerConfig.ServerConfig;
   yield* ServerOwnership.holdServerOwnershipLock(serverRuntimeStatePath).pipe(
     Effect.catchTags({
@@ -62,6 +214,7 @@ const runMigrationsAsOwner = Effect.fn("SqlitePersistence.runMigrationsAsOwner")
     }),
   );
   yield* runMigrations();
+  yield* setupLocalReadIndexes;
 }, Effect.scoped);
 
 // Index builds over large tables take minutes; on the main connection they block the event loop,
@@ -118,7 +271,7 @@ const makeLayerSetup = <E, R>(migrate: Effect.Effect<unknown, E, R>) =>
     }).pipe(Effect.withSpan("Sqlite.setup")),
   );
 
-const layerSetup = makeLayerSetup(runMigrations());
+const layerSetup = makeLayerSetup(runMigrations().pipe(Effect.andThen(setupLocalReadIndexes)));
 
 const makeLayerFromPath = <E, R>(makeSetup: (dbPath: string) => Layer.Layer<never, E, R>) =>
   Effect.fn("makeSqlitePersistenceLive")(function* (dbPath: string) {

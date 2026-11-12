@@ -172,6 +172,7 @@ function startWithMissingWorktree(
             projectionReadCount += 1;
             return Effect.succeed({
               ...projection,
+              subagentRouting: [],
               hasConversation: projection.messages.some(
                 (m) =>
                   m.role === "user" &&
@@ -290,6 +291,9 @@ function makeLocalCommandHarness(input: {
   readonly writeFailure?: unknown;
   readonly failReadsAfterRunning?: boolean;
   readonly recoveryReadFailure?: string;
+  readonly subagentRouting?: Effect.Success<
+    ReturnType<ProjectionStore.ProjectionStoreV2Shape["getTurnStartContext"]>
+  >["subagentRouting"];
   readonly previousTurn?: {
     readonly runStatus: "failed" | "completed";
     readonly turnStatus: "running" | "completed" | "interrupted";
@@ -918,6 +922,7 @@ function makeLocalCommandHarness(input: {
   const getTurnStartContext = vi.fn(() =>
     Effect.succeed({
       ...projection,
+      subagentRouting: input.subagentRouting ?? [],
       hasConversation: projection.messages.some(
         (m) =>
           m.role === "user" &&
@@ -1267,6 +1272,32 @@ effectIt.effect(
       ]);
       expect(JSON.stringify(harness.events)).not.toContain("private git diagnostic");
     }).pipe(Effect.scoped, Effect.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))),
+);
+
+effectIt.effect("starts with ordered completed-subagent routing facts without task payloads", () =>
+  Effect.gen(function* () {
+    const childThreadId = ThreadId.make("completed-child");
+    const providerThreadId = ProviderThreadId.make("completed-child-provider-thread");
+    const harness = makeLocalCommandHarness({
+      text: "Continue",
+      failReadsAfterRunning: true,
+      subagentRouting: [
+        { childThreadId, providerThreadId: null },
+        { childThreadId: null, providerThreadId },
+        { childThreadId, providerThreadId },
+        { childThreadId: null, providerThreadId: null },
+      ],
+    });
+
+    yield* harness.start;
+
+    expect(harness.startRootRun).toHaveBeenCalledExactlyOnceWith(
+      expect.objectContaining({
+        relatedThreadIds: [childThreadId, childThreadId],
+        relatedProviderThreadIds: [providerThreadId, providerThreadId],
+      }),
+    );
+  }),
 );
 
 effectIt.effect("recovers an abandoned failed turn before continuing its native conversation", () =>

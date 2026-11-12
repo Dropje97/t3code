@@ -443,6 +443,14 @@ export interface OrchestratorV2Shape {
     fields: ReadonlyArray<K>,
     filter?: ProjectionRecordFilter,
   ) => Effect.Effect<ProjectionRecords<K>, OrchestratorV2Error>;
+  readonly getSentMessageState: (
+    threadId: ThreadId,
+    messageId: MessageId,
+  ) => Effect.Effect<ProjectionRecords<"runs" | "messages" | "turnItems">, OrchestratorV2Error>;
+  readonly getProviderContinuationState: (
+    threadId: ThreadId,
+    delegatedCompletion?: { readonly parentRunId: RunId; readonly messageId: MessageId },
+  ) => Effect.Effect<ProjectionRecords<"messages" | "runs" | "providerTurns">, OrchestratorV2Error>;
   readonly listAppOwnedChildThreadIds: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, OrchestratorV2Error>;
@@ -1688,6 +1696,52 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       return projection;
     });
+
+  const getThreadWithPendingEvents = Effect.fnUntraced(function* (
+    threadId: ThreadId,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+  ) {
+    const pending = (yield* Ref.get(events)).filter((event) => event.threadId === threadId);
+    const stored = yield* Effect.option(projectionStore.getThreadRecords(threadId, []));
+    let projection: OrchestrationV2ThreadProjection;
+    if (Option.isSome(stored)) {
+      projection = {
+        ...stored.value,
+        runs: [],
+        attempts: [],
+        nodes: [],
+        subagents: [],
+        providerSessions: [],
+        providerThreads: [],
+        providerTurns: [],
+        runtimeRequests: [],
+        messages: [],
+        plans: [],
+        turnItems: [],
+        checkpointScopes: [],
+        checkpoints: [],
+        contextHandoffs: [],
+        contextTransfers: [],
+        visibleTurnItems: [],
+        updatedAt: stored.value.thread.updatedAt,
+      };
+    } else {
+      const created = pending.find(
+        (
+          event,
+        ): event is Extract<OrchestrationV2DomainEvent, { readonly type: "thread.created" }> =>
+          event.type === "thread.created",
+      );
+      if (created === undefined) {
+        return yield* new OrchestratorProjectionError({ threadId });
+      }
+      projection = emptyProjection(created);
+    }
+    for (const event of pending) {
+      projection = applyToProjection(projection, event);
+    }
+    return projection;
+  });
 
   const makeSystemEvent =
     /* This helper runs for individual orchestration events; the enclosing operation owns the span. */
@@ -6884,7 +6938,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     const sourcePlanProjection =
       command.sourcePlanRef === undefined
         ? null
-        : yield* getProjectionWithPendingEvents(command.sourcePlanRef.threadId, events);
+        : yield* getThreadWithPendingEvents(command.sourcePlanRef.threadId, events);
     const sourcePlanArtifact =
       command.sourcePlanRef === undefined
         ? undefined
@@ -15617,6 +15671,20 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       function (threadId, fields, filter) {
         return projectionStore
           .getThreadRecords(threadId, fields, filter)
+          .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+      },
+    ),
+    getSentMessageState: Effect.fn("OrchestratorV2.getSentMessageState")(
+      function (threadId, messageId) {
+        return projectionStore
+          .getSentMessageState(threadId, messageId)
+          .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
+      },
+    ),
+    getProviderContinuationState: Effect.fn("OrchestratorV2.getProviderContinuationState")(
+      function (threadId, delegatedCompletion) {
+        return projectionStore
+          .getProviderContinuationState(threadId, delegatedCompletion)
           .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
       },
     ),

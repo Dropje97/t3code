@@ -1,7 +1,8 @@
-import { assert, describe, it } from "@effect/vitest";
+import { assert, describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
   MessageId,
+  NodeId,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -26,6 +27,8 @@ import * as ProviderContinuationRequests from "@t3tools/provider-core/server/Pro
 import * as Orchestrator from "./Orchestrator.ts";
 import * as ProviderContinuationService from "./ProviderContinuationService.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
+import * as ReadFixture from "./SendContinuationReads.testkit.ts";
+import { isUndeliveredMailboxSteer } from "./NotificationMailbox.ts";
 
 const threadId = ThreadId.make("thread-provider-continuation");
 const providerThreadId = ProviderThreadId.make("provider-thread-continuation");
@@ -94,10 +97,10 @@ const makeGuard = Effect.fnUntraced(function* (completed?: Deferred.Deferred<voi
 
 function layerTest(input: {
   readonly dispatched: Queue.Queue<unknown>;
-  readonly getThreadRecords: () => Effect.Effect<OrchestrationV2ThreadProjection>;
+  readonly getProviderContinuationState: () => Effect.Effect<OrchestrationV2ThreadProjection>;
 }) {
   const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-    getThreadRecords: input.getThreadRecords,
+    getProviderContinuationState: input.getProviderContinuationState,
     dispatch: (command) => Queue.offer(input.dispatched, command).pipe(Effect.as({} as never)),
   });
   const layerWorker = ProviderContinuationService.layer.pipe(
@@ -151,7 +154,7 @@ describe("ProviderContinuationService", () => {
         assert.equal(command.delegatedCompletion.taskIds.length, 2);
       }).pipe(
         Effect.provide(
-          layerTest({ dispatched, getThreadRecords: () => Effect.succeed(recovered) }),
+          layerTest({ dispatched, getProviderContinuationState: () => Effect.succeed(recovered) }),
         ),
         Effect.scoped,
       );
@@ -190,7 +193,7 @@ describe("ProviderContinuationService", () => {
         });
       }).pipe(
         Effect.provide(
-          layerTest({ dispatched, getThreadRecords: () => Effect.succeed(projection) }),
+          layerTest({ dispatched, getProviderContinuationState: () => Effect.succeed(projection) }),
         ),
         Effect.scoped,
       );
@@ -241,7 +244,7 @@ describe("ProviderContinuationService", () => {
         Effect.provide(
           layerTest({
             dispatched,
-            getThreadRecords: () => Effect.succeed(delegatedProjection()),
+            getProviderContinuationState: () => Effect.succeed(delegatedProjection()),
           }),
         ),
         Effect.scoped,
@@ -257,7 +260,7 @@ describe("ProviderContinuationService", () => {
         const cleared = yield* Ref.make(false);
         const disposed = yield* Queue.unbounded<unknown>();
         const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getThreadRecords: () => Effect.succeed(delegatedProjection()),
+          getProviderContinuationState: () => Effect.succeed(delegatedProjection()),
           dispatch: (command) => {
             if ((command as { type: string }).type === "message.dispatch") {
               return Ref.update(attempts, (count) => count + 1).pipe(
@@ -331,7 +334,7 @@ describe("ProviderContinuationService", () => {
       return Effect.gen(function* () {
         const requested = yield* Ref.make(true);
         const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getThreadRecords: () => Effect.succeed(projection),
+          getProviderContinuationState: () => Effect.succeed(projection),
           dispatch: () =>
             Effect.fail(
               new ThreadManagementService.ThreadManagementProviderInstanceDisabledError({
@@ -380,7 +383,7 @@ describe("ProviderContinuationService", () => {
       return Effect.gen(function* () {
         const wakeHeld = yield* Ref.make(true);
         const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getThreadRecords: () => Effect.succeed(projection),
+          getProviderContinuationState: () => Effect.succeed(projection),
           dispatch: () =>
             Effect.fail(
               new ThreadManagementService.ThreadManagementProviderInstanceDisabledError({
@@ -426,7 +429,7 @@ describe("ProviderContinuationService", () => {
       return Effect.gen(function* () {
         const cleared = yield* Deferred.make<void>();
         const layerThreads = Layer.mock(ThreadManagementService.ThreadManagementService)({
-          getThreadRecords: () => Effect.succeed(projection),
+          getProviderContinuationState: () => Effect.succeed(projection),
           dispatch: (command) =>
             Effect.fail(
               new Orchestrator.OrchestratorDispatchError({
@@ -484,7 +487,8 @@ describe("ProviderContinuationService", () => {
             Effect.provide(
               layerTest({
                 dispatched,
-                getThreadRecords: () => Effect.succeed(delegatedProjection(disposition)),
+                getProviderContinuationState: () =>
+                  Effect.succeed(delegatedProjection(disposition)),
               }),
             ),
             Effect.scoped,
@@ -518,7 +522,7 @@ describe("ProviderContinuationService", () => {
         Effect.provide(
           layerTest({
             dispatched,
-            getThreadRecords: () =>
+            getProviderContinuationState: () =>
               Effect.succeed({
                 ...delegatedProjection(),
                 messages: [{ id: delegatedMessageId }],
@@ -541,7 +545,7 @@ describe("ProviderContinuationService", () => {
         assert.isTrue(Option.isNone(yield* Queue.poll(dispatched)));
       }).pipe(
         Effect.provide(
-          layerTest({ dispatched, getThreadRecords: () => Effect.succeed(projection) }),
+          layerTest({ dispatched, getProviderContinuationState: () => Effect.succeed(projection) }),
         ),
         Effect.scoped,
       );
@@ -568,7 +572,7 @@ describe("ProviderContinuationService", () => {
         Effect.provide(
           layerTest({
             dispatched,
-            getThreadRecords: () =>
+            getProviderContinuationState: () =>
               Deferred.succeed(projectionEntered, undefined).pipe(
                 Effect.andThen(Deferred.await(releaseProjection)),
                 Effect.as(projection),
@@ -603,7 +607,7 @@ describe("ProviderContinuationService", () => {
         Effect.provide(
           layerTest({
             dispatched,
-            getThreadRecords: () => {
+            getProviderContinuationState: () => {
               projectionCalls += 1;
               return projectionCalls === 1
                 ? Deferred.succeed(firstProjectionEntered, undefined).pipe(
@@ -619,3 +623,187 @@ describe("ProviderContinuationService", () => {
     });
   });
 });
+
+const continuationReadCases = [
+  "ordinary",
+  "no-message",
+  "missing-source",
+  "stopped-source",
+  "disposed-source",
+  "missing-cohort",
+  "null-delivery",
+  "generation-mismatch",
+  "message-mismatch",
+  "empty-task-list",
+  "single-task",
+  "missing-delivery-run",
+  "runless-message",
+  "terminal-completed",
+  "terminal-failed",
+  "terminal-interrupted",
+  "terminal-cancelled",
+  "terminal-rolled_back",
+  "own-user-run",
+  "null-attempt",
+  "latest-running",
+  "latest-completed",
+  "tie-completed-first",
+  "tie-running-first",
+  "binary-provider-tie",
+  "owner-is-delivery-run",
+  "wrong-role-message",
+  "missing-message-metadata",
+  "archived",
+  "deleted",
+] as const;
+
+it.effect.each(continuationReadCases)(
+  "continuation state equals main's relevant records for %s",
+  (scenario) =>
+    Effect.gen(function* () {
+      const fixture = yield* ReadFixture.seed();
+      const { store, threadId } = fixture;
+      const messageId = MessageId.make("delivery-message");
+      const source = fixture.run(21, {
+        status: "running",
+        completedAt: null,
+        delegatedCompletion: {
+          disposition:
+            scenario === "stopped-source"
+              ? "stopped"
+              : scenario === "disposed-source"
+                ? "disposed"
+                : "open",
+          nextGeneration: 8,
+          delivery: {
+            generation: scenario === "generation-mismatch" ? 6 : 7,
+            messageId:
+              scenario === "message-mismatch" ? MessageId.make("different-message") : messageId,
+            taskIds:
+              scenario === "empty-task-list"
+                ? []
+                : scenario === "single-task"
+                  ? [NodeId.make("task-a")]
+                  : [NodeId.make("task-b"), NodeId.make("task-a"), NodeId.make("task-b")],
+          },
+        },
+      });
+      if (scenario === "missing-cohort") {
+        const { delegatedCompletion: _completion, ...withoutCompletion } = source;
+        yield* fixture.putRun(withoutCompletion);
+      } else if (scenario === "null-delivery") {
+        yield* fixture.putRun({
+          ...source,
+          delegatedCompletion: { ...source.delegatedCompletion!, delivery: null },
+        });
+      } else if (scenario !== "missing-source") yield* fixture.putRun(source);
+      const delivery = fixture.run(22, {
+        status: scenario.startsWith("terminal-")
+          ? (scenario.slice("terminal-".length) as
+              | "completed"
+              | "failed"
+              | "interrupted"
+              | "cancelled"
+              | "rolled_back")
+          : "running",
+        completedAt: null,
+        ...(scenario === "own-user-run" ? { userMessageId: messageId } : {}),
+        ...(scenario === "null-attempt" ? { activeAttemptId: null } : {}),
+      });
+      if (scenario !== "missing-delivery-run") yield* fixture.putRun(delivery);
+      const owner = scenario === "owner-is-delivery-run" ? source : delivery;
+      if (scenario !== "no-message") {
+        yield* fixture.putMessage(
+          fixture.message(messageId, scenario === "runless-message" ? null : owner.id, {
+            role: scenario === "wrong-role-message" ? "assistant" : "user",
+            ...(scenario === "missing-message-metadata"
+              ? {}
+              : { delegatedCompletion: { parentRunId: source.id, generation: 7, taskIds: [] } }),
+          }),
+        );
+      }
+      yield* fixture.putTurn(
+        fixture.turn(owner, 1, scenario === "latest-running" ? "completed" : "running"),
+      );
+      yield* fixture.putTurn(
+        fixture.turn(owner, 2, scenario === "latest-running" ? "running" : "completed"),
+      );
+      if (scenario.startsWith("tie-") || scenario === "binary-provider-tie") {
+        yield* fixture.putTurn(
+          fixture.turn(owner, 3, scenario === "tie-running-first" ? "running" : "completed", {
+            providerThreadId: ProviderThreadId.make(
+              scenario === "binary-provider-tie" ? "z-provider" : "a-provider",
+            ),
+          }),
+        );
+        yield* fixture.putTurn(
+          fixture.turn(owner, 3, scenario === "tie-running-first" ? "completed" : "running", {
+            id: fixture.turn(owner, 4, "running").id,
+            providerThreadId: ProviderThreadId.make(
+              scenario === "binary-provider-tie" ? "ä-provider" : "z-provider",
+            ),
+          }),
+        );
+      }
+      if (scenario === "archived" || scenario === "deleted") {
+        yield* fixture.putThread({
+          ...fixture.thread,
+          ...(scenario === "archived" ? { archivedAt: fixture.now } : { deletedAt: fixture.now }),
+        });
+      }
+      const completion =
+        scenario === "ordinary" ? undefined : { parentRunId: source.id, generation: 7, messageId };
+      const broad = yield* store.getThreadRecords(threadId, ["messages", "runs", "providerTurns"], {
+        messageIds: completion === undefined ? [] : [messageId],
+      });
+      const sql = ReadFixture.traceSql();
+      const narrow = yield* store
+        .getProviderContinuationState(threadId, completion)
+        .pipe(Effect.withTracer(sql.tracer));
+      expect(narrow.thread).toEqual(broad.thread);
+      if (completion === undefined) {
+        expect(narrow.messages).toEqual([]);
+        expect(narrow.runs).toEqual([]);
+        expect(narrow.providerTurns).toEqual([]);
+        expect(
+          sql.queries.some(({ query }) =>
+            /FROM orchestration_v2_projection_(runs|provider_turns|messages|turn_items|run_attempts|nodes)\b/.test(
+              query,
+            ),
+          ),
+        ).toBe(false);
+      } else {
+        const owningRunId = broad.messages[0]?.runId;
+        const runs = broad.runs.filter((run) => run.id === source.id || run.id === owningRunId);
+        const attemptId = runs.find((run) => run.id === owningRunId)?.activeAttemptId;
+        expect(narrow.messages).toEqual(broad.messages);
+        expect(narrow.runs).toEqual(runs);
+        expect(narrow.providerTurns).toEqual(
+          attemptId == null
+            ? []
+            : broad.providerTurns.filter((turn) => turn.runAttemptId === attemptId),
+        );
+        expect(isUndeliveredMailboxSteer(narrow, messageId)).toBe(
+          isUndeliveredMailboxSteer(broad, messageId),
+        );
+      }
+      const selects = sql.queries.filter(({ query }) => /^\s*SELECT\b/i.test(query));
+      expect(selects.length).toBeGreaterThan(0);
+      expect(selects.every(({ transaction }) => transaction !== null)).toBe(true);
+      expect(new Set(selects.map(({ transaction }) => transaction)).size).toBe(1);
+      if (scenario === "generation-mismatch") {
+        // The retry path must observe cohort changes made after the initial dispatch read.
+        yield* fixture.putRun({
+          ...source,
+          delegatedCompletion: {
+            ...source.delegatedCompletion!,
+            delivery: { ...source.delegatedCompletion!.delivery!, generation: 8 },
+          },
+        });
+        const fresh = yield* store.getProviderContinuationState(threadId, completion);
+        expect(
+          fresh.runs.find((run) => run.id === source.id)?.delegatedCompletion?.delivery?.generation,
+        ).toBe(8);
+      }
+    }).pipe(Effect.provide(ReadFixture.layerDatabase)),
+);

@@ -778,13 +778,12 @@ const make = Effect.gen(function* () {
       Effect.andThen(orchestrator.dispatch(command)),
     );
 
-  const getProjectThreadRecords: ThreadManagementServiceShape["getProjectThreadRecords"] = (
-    input,
-    fields,
-    filter,
+  const readProjectThread = <A extends Pick<OrchestrationV2ThreadProjection, "thread">, E>(
+    input: Pick<ThreadManagementSendInput, "projectId" | "threadId">,
+    read: Effect.Effect<A, E>,
   ) =>
     ensureProjectionTranscript(input.threadId).pipe(
-      Effect.andThen(orchestrator.getThreadRecords(input.threadId, fields, filter)),
+      Effect.andThen(read),
       Effect.mapError(
         (cause) =>
           new ThreadManagementProjectionLoadError({
@@ -803,6 +802,12 @@ const make = Effect.gen(function* () {
           }),
       ),
     );
+
+  const getProjectThreadRecords: ThreadManagementServiceShape["getProjectThreadRecords"] = (
+    input,
+    fields,
+    filter,
+  ) => readProjectThread(input, orchestrator.getThreadRecords(input.threadId, fields, filter));
 
   const listProjectThreads: ThreadManagementServiceShape["listProjectThreads"] = (input) =>
     orchestrator
@@ -892,10 +897,10 @@ const make = Effect.gen(function* () {
       createdBy: input.createdBy,
       creationSource: input.creationSource,
     });
-    const projection = yield* getProjectThreadRecords(input, ["runs", "messages", "turnItems"], {
-      messageIds: [input.messageId],
-      turnItemTypes: ["user_message"],
-    });
+    const projection = yield* readProjectThread(
+      input,
+      orchestrator.getSentMessageState(input.threadId, input.messageId),
+    );
     const message = projection.messages.find((candidate) => candidate.id === input.messageId);
     const run =
       message?.runId === null || message?.runId === undefined

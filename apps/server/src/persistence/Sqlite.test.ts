@@ -309,9 +309,343 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("layerCliConfig",
   it.effect("opens a current T3 home while a running server owns it", () =>
     Effect.gen(function* () {
       yield* migrateTo();
+      const { dbPath } = yield* ServerConfig.ServerConfig;
+      yield* Effect.void.pipe(Effect.provide(SqlitePersistence.layerFromPath(dbPath)));
       yield* ownT3Home();
 
       yield* Effect.void.pipe(Effect.provide(SqlitePersistence.layerCliConfig));
     }).pipe(Effect.scoped, Effect.provide(layerT3Home)),
   );
+
+  it.effect.each(["missing", "obsolete"] as const)(
+    "does not change %s local schema while a running server owns a current database",
+    (state) =>
+      Effect.gen(function* () {
+        yield* migrateTo();
+        const { dbPath } = yield* ServerConfig.ServerConfig;
+        if (state === "obsolete") {
+          yield* Effect.void.pipe(Effect.provide(SqlitePersistence.layerFromPath(dbPath)));
+          const database = new NodeSqlite.DatabaseSync(dbPath);
+          try {
+            database.exec(previousLocalCountsSql);
+          } finally {
+            database.close();
+          }
+        }
+        const schema = () => {
+          const database = new NodeSqlite.DatabaseSync(dbPath, { readOnly: true });
+          try {
+            return database
+              .prepare("SELECT type, name, sql FROM sqlite_schema ORDER BY name")
+              .all();
+          } finally {
+            database.close();
+          }
+        };
+        const before = schema();
+        yield* ownT3Home();
+        const opened = yield* Effect.void.pipe(
+          Effect.provide(SqlitePersistence.layerCliConfig),
+          Effect.result,
+        );
+        assert.equal(opened._tag, "Failure");
+        if (opened._tag === "Failure") {
+          assert.instanceOf(opened.failure, SqlitePersistence.ServerOwnsDatabaseError);
+        }
+        assert.deepEqual(schema(), before);
+        assert.equal(
+          yield* latestRecordedMigrationId,
+          Math.max(...migrationManifest.map(([id]) => id)),
+        );
+      }).pipe(Effect.scoped, Effect.provide(layerT3Home)),
+  );
+});
+
+// Installed by the previous deployed build, before main migrations 81–85.
+const previousLocalIndexSql = `
+CREATE INDEX IF NOT EXISTS local_projection_threads_active_updated_idx
+      ON orchestration_v2_projection_threads(updated_at, thread_id)
+      WHERE deleted_at IS NULL AND archived_at IS NULL;
+CREATE INDEX IF NOT EXISTS local_projection_threads_pull_requests_guarded_idx
+      ON orchestration_v2_projection_threads(updated_at, thread_id)
+      WHERE deleted_at IS NULL AND archived_at IS NULL
+        AND CASE WHEN json_valid(payload_json)
+          THEN json_array_length(payload_json, '$.pullRequests') > 0 ELSE 0 END;
+CREATE INDEX IF NOT EXISTS local_projection_provider_turns_live_idx
+      ON orchestration_v2_projection_provider_turns(thread_id, status, run_attempt_id)
+      WHERE status IN ('pending', 'starting', 'running', 'waiting');
+CREATE INDEX IF NOT EXISTS local_projection_subagents_recovery_private_idx
+      ON orchestration_v2_projection_subagents(thread_id, status, provider_thread_id)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_turn_items_type_private_idx
+      ON orchestration_v2_projection_turn_items(thread_id, type, ordinal, turn_item_id)
+      WHERE type <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_message_item_order_private_idx
+      ON orchestration_v2_projection_turn_items(thread_id, json_extract(payload_json, '$.messageId'), ordinal)
+      WHERE type IN ('user_message', 'assistant_message') AND type <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_runs_completed_private_idx
+      ON orchestration_v2_projection_runs(thread_id, completed_at, ordinal, run_id)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_threads_limit_wake_guarded_idx
+      ON orchestration_v2_projection_threads(
+        (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.limitRecovery.resetAt') END),
+        (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.snoozedUntil') END))
+      WHERE deleted_at IS NULL AND CASE WHEN json_valid(payload_json)
+        THEN json_extract(payload_json, '$.limitRecovery.autoResume') = 1 ELSE 0 END;
+CREATE INDEX IF NOT EXISTS local_projection_turn_items_timeline_private_idx
+      ON orchestration_v2_projection_turn_items(thread_id, ordinal, turn_item_id, run_id, node_id,
+        parent_item_id, type, status,
+        (CASE WHEN type IN ('user_message', 'assistant_message') THEN json_extract(payload_json, '$.messageId') END),
+        (CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.inputIntent') END),
+        (CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.createdBy') END),
+        (CASE WHEN type = 'dynamic_tool' AND (payload_json LIKE '%htmlRender%' OR payload_json LIKE '%t3McpApp%' OR payload_json LIKE '%"viewedImagePath"%' OR payload_json LIKE '%"toolName":"%delegate_task"%') THEN 1 ELSE 0 END))
+      WHERE type <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_nodes_root_status_private_idx
+      ON orchestration_v2_projection_nodes(node_id, root_node_id, status)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_runs_timeline_metadata_private_idx
+      ON orchestration_v2_projection_runs(thread_id, ordinal, run_id, status)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_attempts_timeline_metadata_ids_private_idx
+      ON orchestration_v2_projection_run_attempts(thread_id, run_id, attempt_ordinal, root_node_id, attempt_id, status)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_nodes_thread_root_status_private_idx
+      ON orchestration_v2_projection_nodes(thread_id, node_id, root_node_id, status)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_run_attempts_latest_private_idx
+      ON orchestration_v2_projection_run_attempts(run_id, root_node_id, attempt_ordinal, attempt_id, status)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_runs_status_private_idx
+      ON orchestration_v2_projection_runs(run_id, status)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_messages_compact_private_idx
+      ON orchestration_v2_projection_messages(thread_id, lower(trim(json_extract(payload_json, '$.text'),
+        char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200,
+          8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279))))
+      WHERE role = 'user' AND role <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_nodes_structural_idx
+      ON orchestration_v2_projection_nodes(thread_id)
+      WHERE kind NOT IN ('tool_call', 'assistant_message', 'reasoning')
+        OR status NOT IN ('completed', 'interrupted', 'failed', 'cancelled', 'rolled_back')
+        OR run_id IS NULL;
+CREATE INDEX IF NOT EXISTS local_projection_turn_items_subagent_private_idx
+      ON orchestration_v2_projection_turn_items(thread_id,
+        (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.subagentId') END),
+        ordinal, turn_item_id)
+      WHERE type = 'subagent' AND type <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_attempts_live_private_idx
+      ON orchestration_v2_projection_run_attempts(thread_id, root_node_id)
+      WHERE status IN ('pending','starting','running','waiting') AND status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_provider_turns_node_private_idx
+      ON orchestration_v2_projection_provider_turns(thread_id, node_id)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_provider_turns_usage_private_idx
+      ON orchestration_v2_projection_provider_turns(thread_id,
+        (CASE WHEN json_valid(payload_json)
+          THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
+        provider_thread_id, ordinal)
+      WHERE (CASE WHEN json_valid(payload_json)
+        THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL;
+CREATE INDEX IF NOT EXISTS local_projection_provider_turns_attempt_private_idx
+      ON orchestration_v2_projection_provider_turns(thread_id, run_attempt_id, provider_thread_id,
+        ordinal)
+      WHERE status <> 'local-index-private';
+CREATE INDEX IF NOT EXISTS local_projection_checkpoints_window_private_idx
+      ON orchestration_v2_projection_checkpoints(thread_id, status, run_id, node_id,
+        ordinal_within_scope, checkpoint_id)
+      WHERE status <> 'local-index-private';
+`;
+
+const previousLocalCountsSql = `
+CREATE TABLE IF NOT EXISTS local_turn_item_counts (
+    thread_id TEXT NOT NULL,
+    run_key TEXT NOT NULL,
+    item_count INTEGER NOT NULL,
+    PRIMARY KEY (thread_id, run_key)
+  ) WITHOUT ROWID;
+CREATE TRIGGER local_turn_item_counts_insert
+          AFTER INSERT ON orchestration_v2_projection_turn_items
+          BEGIN
+            INSERT INTO local_turn_item_counts (thread_id, run_key, item_count)
+            VALUES (NEW.thread_id, COALESCE(NEW.run_id, ''), 1)
+            ON CONFLICT (thread_id, run_key) DO UPDATE SET item_count = item_count + 1;
+          END;
+CREATE TRIGGER local_turn_item_counts_delete
+          AFTER DELETE ON orchestration_v2_projection_turn_items
+          BEGIN
+            UPDATE local_turn_item_counts SET item_count = item_count - 1
+            WHERE thread_id = OLD.thread_id AND run_key = COALESCE(OLD.run_id, '');
+            DELETE FROM local_turn_item_counts
+            WHERE thread_id = OLD.thread_id AND run_key = COALESCE(OLD.run_id, '')
+              AND item_count <= 0;
+          END;
+CREATE TRIGGER local_turn_item_counts_move
+          AFTER UPDATE OF thread_id, run_id ON orchestration_v2_projection_turn_items
+          WHEN OLD.thread_id IS NOT NEW.thread_id OR OLD.run_id IS NOT NEW.run_id
+          BEGIN
+            UPDATE local_turn_item_counts SET item_count = item_count - 1
+            WHERE thread_id = OLD.thread_id AND run_key = COALESCE(OLD.run_id, '');
+            DELETE FROM local_turn_item_counts
+            WHERE thread_id = OLD.thread_id AND run_key = COALESCE(OLD.run_id, '')
+              AND item_count <= 0;
+            INSERT INTO local_turn_item_counts (thread_id, run_key, item_count)
+            VALUES (NEW.thread_id, COALESCE(NEW.run_id, ''), 1)
+            ON CONFLICT (thread_id, run_key) DO UPDATE SET item_count = item_count + 1;
+          END;
+`;
+
+const stageOneLocalIndexNames = [
+  "local_projection_threads_active_updated_idx",
+  "local_projection_threads_pull_requests_guarded_idx",
+  "local_projection_provider_turns_live_idx",
+  "local_projection_turn_items_type_private_idx",
+  "local_projection_message_item_order_guarded_private_idx",
+  "local_projection_threads_limit_wake_guarded_idx",
+  "local_projection_runs_status_private_idx",
+  "local_projection_messages_compact_guarded_private_idx",
+  "local_projection_attempts_live_private_idx",
+  "local_projection_provider_turns_node_private_idx",
+  "local_projection_provider_turns_usage_guarded_private_idx",
+  "local_projection_provider_turns_attempt_private_idx",
+  "local_projection_checkpoints_window_private_idx",
+  "local_projection_subagents_run_private_idx",
+  "local_projection_subagents_routing_private_idx",
+  "local_projection_threads_worktree_guarded_idx",
+];
+
+it.effect(
+  "replaces the deployed local schema after upstream migrations and remains idempotent",
+  () => {
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-local-upgrade-"));
+    const dbPath = NodePath.join(tempDir, "state.sqlite");
+    const persistence = () =>
+      SqlitePersistence.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer));
+
+    return Effect.gen(function* () {
+      yield* runMigrations({ toMigrationInclusive: 80 }).pipe(
+        Effect.provide(NodeSqliteClient.layer({ filename: dbPath })),
+      );
+      const legacy = new NodeSqlite.DatabaseSync(dbPath);
+      try {
+        legacy.exec(previousLocalIndexSql);
+        legacy.exec(previousLocalCountsSql);
+        legacy.exec(`INSERT INTO orchestration_v2_projection_turn_items
+        (turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json)
+        VALUES ('retained-item', 'retained-thread', 'retained-run', 1, 'user_message', 'completed', '2026-11-12T00:00:00.000Z', '{}')`);
+        assert.equal(
+          legacy
+            .prepare(
+              "SELECT COUNT(*) AS n FROM sqlite_schema WHERE type = 'index' AND name GLOB 'local_projection_*'",
+            )
+            .get()?.n,
+          23,
+        );
+        assert.equal(
+          legacy.prepare("SELECT SUM(item_count) AS n FROM local_turn_item_counts").get()?.n,
+          1,
+        );
+        // Earlier development definitions need only their names to exercise startup cleanup.
+        for (const suffix of [
+          "threads_pull_requests_idx",
+          "turn_items_live_idx",
+          "subagents_recovery_idx",
+          "turn_items_thread_type_idx",
+          "message_item_order_idx",
+          "threads_limit_wake_private_idx",
+          "threads_limit_wake_idx",
+          "nodes_root_private_idx",
+          "run_attempts_root_private_idx",
+        ]) {
+          legacy.exec(
+            `CREATE INDEX local_projection_${suffix} ON orchestration_v2_projection_threads(thread_id)`,
+          );
+        }
+      } finally {
+        legacy.close();
+      }
+
+      let installedSchema:
+        | ReadonlyArray<{
+            readonly type: string;
+            readonly name: string;
+            readonly sql: string | null;
+          }>
+        | undefined;
+      for (const restart of [0, 1]) {
+        yield* Effect.gen(function* () {
+          const sql = yield* SqlClient.SqlClient;
+          const localIndexes = yield* sql<{ readonly name: string }>`
+          SELECT name FROM sqlite_schema WHERE type = 'index' AND name GLOB 'local_projection_*' ORDER BY name
+        `;
+          assert.deepEqual(
+            localIndexes.map((row) => row.name),
+            stageOneLocalIndexNames.toSorted(),
+          );
+          const localCounts =
+            yield* sql`SELECT name FROM sqlite_schema WHERE name GLOB 'local_turn_item_counts*'`;
+          assert.deepEqual(localCounts, []);
+          const upstreamCounts = yield* sql<{ readonly item_count: number }>`
+          SELECT item_count FROM orchestration_v2_projection_turn_item_counts
+          WHERE thread_id = 'retained-thread' AND run_key = 'retained-run'
+        `;
+          assert.equal(upstreamCounts[0]?.item_count, restart === 0 ? 1 : 2);
+          const upstreamTriggers = yield* sql<{ readonly name: string }>`
+          SELECT name FROM sqlite_schema WHERE type = 'trigger' AND name GLOB 'orchestration_v2_turn_item_counts_*' ORDER BY name
+        `;
+          assert.deepEqual(
+            upstreamTriggers.map((row) => row.name),
+            [
+              "orchestration_v2_turn_item_counts_delete",
+              "orchestration_v2_turn_item_counts_insert",
+              "orchestration_v2_turn_item_counts_update",
+            ],
+          );
+          const schema = yield* sql<{
+            readonly type: string;
+            readonly name: string;
+            readonly sql: string | null;
+          }>`
+          SELECT type, name, sql FROM sqlite_schema ORDER BY name
+        `;
+          if (installedSchema === undefined) installedSchema = schema;
+          else assert.deepEqual(schema, installedSchema);
+          if (restart === 0) {
+            yield* sql`INSERT INTO orchestration_v2_projection_turn_items
+            (turn_item_id, thread_id, run_id, ordinal, type, status, updated_at, payload_json)
+            VALUES ('new-item', 'retained-thread', 'retained-run', 2, 'user_message', 'completed', '2026-11-12T00:00:00.000Z', '{}')`;
+          }
+        }).pipe(Effect.provide(persistence()));
+      }
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
+    );
+  },
+);
+
+// Migration 85's count triggers miss REPLACE's implicit delete when recursive_triggers is off.
+it("turn-item writers preserve the upstream count triggers", () => {
+  const sources = [
+    NodePath.resolve(import.meta.dirname, "../orchestration-v2/ProjectionStore.ts"),
+    NodePath.resolve(import.meta.dirname, "../orchestration-v2/EventSink.ts"),
+  ];
+  const visitMigrations = (directory: string) => {
+    for (const entry of NodeFS.readdirSync(directory, { withFileTypes: true })) {
+      const path = NodePath.join(directory, entry.name);
+      if (entry.isDirectory()) visitMigrations(path);
+      else if (entry.name.endsWith(".ts") && !entry.name.endsWith(".test.ts")) sources.push(path);
+    }
+  };
+  visitMigrations(NodePath.join(import.meta.dirname, "Migrations"));
+  const offenders = sources.filter((path) => {
+    const source = NodeFS.readFileSync(path, "utf8");
+    return (
+      /(?:INSERT\s+OR\s+REPLACE|REPLACE)\s+INTO\s+orchestration_v2_projection_turn_items\b/i.test(
+        source,
+      ) ||
+      /orchestration_v2_projection_turn_items[\s\S]{0,200}ON\s+CONFLICT[^;]*?DO\s+REPLACE/i.test(
+        source,
+      )
+    );
+  });
+  assert.deepEqual(offenders, []);
 });

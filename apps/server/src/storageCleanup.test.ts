@@ -398,8 +398,9 @@ const cleanupFixture = (
           ),
       } as unknown as ProjectStore.ProjectStoreV2["Service"]),
       Effect.provideService(ProjectionStore.ProjectionStoreV2, {
-        getShellSnapshot: (input?: { location?: string }) =>
+        getShellSnapshot: (input?: ProjectionStore.ShellSnapshotOptions) =>
           Effect.sync(() => {
+            expect(input?.withoutItemCounts).toBe(true);
             snapshotReads++;
             const visible = threads.filter((thread) => thread.deletedAt === null);
             return {

@@ -96,7 +96,9 @@ const make = Effect.gen(function* () {
     function* (event) {
       if (event.type === "run.updated") {
         if (!["completed", "failed", "waiting"].includes(event.payload.status)) return;
-        const parent = yield* projections.getThreadRecords(event.threadId, ["subagents"]);
+        const parent = yield* projections.getThreadRecords(event.threadId, ["subagents"], {
+          subagentRunIds: [event.payload.id],
+        });
         if (parent.thread.archivedAt !== null || parent.thread.deletedAt !== null) return;
         for (const task of parent.subagents) {
           if (
@@ -184,7 +186,6 @@ const make = Effect.gen(function* () {
         yield* cancelQueuedWakes(parentThreadId, [event.payload.id]);
         return;
       }
-      const parent = yield* projections.getThreadRecords(parentThreadId, ["subagents", "runs"]);
       const { runs } = yield* projections.getThreadRecords(child.id, ["runs"]);
       const run =
         runs.find((run) => run.id === event.runId) ??
@@ -192,6 +193,10 @@ const make = Effect.gen(function* () {
       const taskId =
         run?.delegatedTaskId ??
         (child.forkedFrom?.type === "node" ? child.forkedFrom.nodeId : undefined);
+      if (taskId === undefined) return;
+      const parent = yield* projections.getThreadRecords(parentThreadId, ["subagents", "runs"], {
+        subagentIds: [taskId],
+      });
       const task = parent.subagents.find(
         (candidate) => candidate.origin === "app_owned" && candidate.id === taskId,
       );
