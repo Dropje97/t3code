@@ -55,18 +55,25 @@ const LOCAL_READ_INDEX_NAMES = [
   "local_projection_threads_pull_requests_guarded_idx",
   "local_projection_provider_turns_live_idx",
   "local_projection_turn_items_type_private_idx",
-  "local_projection_message_item_order_guarded_private_idx",
+  "local_projection_message_item_order_private_idx",
   "local_projection_threads_limit_wake_guarded_idx",
   "local_projection_runs_status_private_idx",
-  "local_projection_messages_compact_guarded_private_idx",
+  "local_projection_messages_compact_private_idx",
   "local_projection_attempts_live_private_idx",
   "local_projection_provider_turns_node_private_idx",
-  "local_projection_provider_turns_usage_guarded_private_idx",
+  "local_projection_provider_turns_usage_now_private_idx",
   "local_projection_provider_turns_attempt_private_idx",
   "local_projection_checkpoints_window_private_idx",
   "local_projection_subagents_run_private_idx",
   "local_projection_subagents_routing_private_idx",
   "local_projection_threads_worktree_guarded_idx",
+  "local_projection_turn_items_timeline_private_idx",
+  "local_projection_nodes_root_status_private_idx",
+  "local_projection_runs_timeline_metadata_private_idx",
+  "local_projection_attempts_timeline_metadata_ids_private_idx",
+  "local_projection_nodes_thread_root_status_private_idx",
+  "local_projection_run_attempts_latest_private_idx",
+  "local_projection_turn_items_subagent_private_idx",
 ] as const;
 const OBSOLETE_LOCAL_SCHEMA_NAMES = [
   "local_turn_item_counts_insert",
@@ -74,27 +81,18 @@ const OBSOLETE_LOCAL_SCHEMA_NAMES = [
   "local_turn_item_counts_move",
   "local_turn_item_counts",
   "local_projection_provider_turns_usage_private_idx",
-  "local_projection_attempts_timeline_metadata_ids_private_idx",
   "local_projection_message_item_order_idx",
-  "local_projection_message_item_order_private_idx",
-  "local_projection_messages_compact_private_idx",
   "local_projection_nodes_root_private_idx",
-  "local_projection_nodes_root_status_private_idx",
   "local_projection_nodes_structural_idx",
-  "local_projection_nodes_thread_root_status_private_idx",
-  "local_projection_run_attempts_latest_private_idx",
   "local_projection_run_attempts_root_private_idx",
   "local_projection_runs_completed_private_idx",
-  "local_projection_runs_timeline_metadata_private_idx",
   "local_projection_subagents_recovery_idx",
   "local_projection_subagents_recovery_private_idx",
   "local_projection_threads_limit_wake_idx",
   "local_projection_threads_limit_wake_private_idx",
   "local_projection_threads_pull_requests_idx",
   "local_projection_turn_items_live_idx",
-  "local_projection_turn_items_subagent_private_idx",
   "local_projection_turn_items_thread_type_idx",
-  "local_projection_turn_items_timeline_private_idx",
 ] as const;
 
 const setupLocalReadIndexes = Effect.gen(function* () {
@@ -107,27 +105,18 @@ const setupLocalReadIndexes = Effect.gen(function* () {
   yield* sql`DROP TRIGGER IF EXISTS local_turn_item_counts_move`;
   yield* sql`DROP TABLE IF EXISTS local_turn_item_counts`;
   yield* sql`DROP INDEX IF EXISTS local_projection_provider_turns_usage_private_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_attempts_timeline_metadata_ids_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_message_item_order_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_message_item_order_private_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_messages_compact_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_nodes_root_private_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_nodes_root_status_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_nodes_structural_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_nodes_thread_root_status_private_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_run_attempts_latest_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_run_attempts_root_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_runs_completed_private_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_runs_timeline_metadata_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_subagents_recovery_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_subagents_recovery_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_threads_limit_wake_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_threads_limit_wake_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_threads_pull_requests_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_live_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_subagent_private_idx`;
   yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_thread_type_idx`;
-  yield* sql`DROP INDEX IF EXISTS local_projection_turn_items_timeline_private_idx`;
   yield* sql`CREATE INDEX IF NOT EXISTS local_projection_threads_active_updated_idx
   ON orchestration_v2_projection_threads(updated_at, thread_id)
   WHERE deleted_at IS NULL AND archived_at IS NULL`;
@@ -142,8 +131,9 @@ const setupLocalReadIndexes = Effect.gen(function* () {
   yield* sql`CREATE INDEX IF NOT EXISTS local_projection_turn_items_type_private_idx
   ON orchestration_v2_projection_turn_items(thread_id, type, ordinal, turn_item_id)
   WHERE type <> 'local-index-private'`;
-  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_message_item_order_guarded_private_idx
-  ON orchestration_v2_projection_turn_items(thread_id, (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.messageId') END), ordinal)
+  // Production's definition; main writes valid JSON, so unguarded expressions stay writable.
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_message_item_order_private_idx
+  ON orchestration_v2_projection_turn_items(thread_id, json_extract(payload_json, '$.messageId'), ordinal)
   WHERE type IN ('user_message', 'assistant_message') AND type <> 'local-index-private'`;
   yield* sql`CREATE INDEX IF NOT EXISTS local_projection_threads_limit_wake_guarded_idx
   ON orchestration_v2_projection_threads(
@@ -154,8 +144,8 @@ const setupLocalReadIndexes = Effect.gen(function* () {
   yield* sql`CREATE INDEX IF NOT EXISTS local_projection_runs_status_private_idx
   ON orchestration_v2_projection_runs(run_id, status)
   WHERE status <> 'local-index-private'`;
-  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_messages_compact_guarded_private_idx
-  ON orchestration_v2_projection_messages(thread_id, lower(trim((CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.text') END),
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_messages_compact_private_idx
+  ON orchestration_v2_projection_messages(thread_id, lower(trim(json_extract(payload_json, '$.text'),
     char(9, 10, 11, 12, 13, 32, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200,
       8201, 8202, 8232, 8233, 8239, 8287, 12288, 65279))))
   WHERE role = 'user' AND role <> 'local-index-private'`;
@@ -165,10 +155,10 @@ const setupLocalReadIndexes = Effect.gen(function* () {
   yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_node_private_idx
   ON orchestration_v2_projection_provider_turns(thread_id, node_id)
   WHERE status <> 'local-index-private'`;
-  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_usage_guarded_private_idx
+  // julianday('now') is not deterministic, so an index may not evaluate it; 'now' rows stay unkeyed.
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_usage_now_private_idx
   ON orchestration_v2_projection_provider_turns(thread_id,
-    (CASE WHEN json_valid(payload_json)
-      THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
+    (CASE WHEN json_valid(payload_json) AND lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) IS NOT 'now' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
     provider_thread_id, ordinal)
   WHERE status <> 'local-index-private' AND (CASE WHEN json_valid(payload_json)
     THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL`;
@@ -191,6 +181,37 @@ const setupLocalReadIndexes = Effect.gen(function* () {
     (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.worktreePath') END))
   WHERE deleted_at IS NULL
     AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.worktreePath') END) IS NOT NULL`;
+  // History metadata (readTimelineIndex, retainedWindowRows): item, run, attempt and node columns
+  // without reading payload rows. Expressions must match those reads exactly.
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_turn_items_timeline_private_idx
+  ON orchestration_v2_projection_turn_items(thread_id, ordinal, turn_item_id, run_id, node_id,
+    parent_item_id, type, status,
+    (CASE WHEN type IN ('user_message', 'assistant_message') THEN json_extract(payload_json, '$.messageId') END),
+    (CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.inputIntent') END),
+    (CASE WHEN type = 'user_message' THEN json_extract(payload_json, '$.createdBy') END),
+    (CASE WHEN type = 'dynamic_tool' AND (payload_json LIKE '%htmlRender%' OR payload_json LIKE '%t3McpApp%' OR payload_json LIKE '%"viewedImagePath"%' OR payload_json LIKE '%"toolName":"%delegate_task"%') THEN 1 ELSE 0 END))
+  WHERE type <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_nodes_root_status_private_idx
+  ON orchestration_v2_projection_nodes(node_id, root_node_id, status)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_runs_timeline_metadata_private_idx
+  ON orchestration_v2_projection_runs(thread_id, ordinal, run_id, status)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_attempts_timeline_metadata_ids_private_idx
+  ON orchestration_v2_projection_run_attempts(thread_id, run_id, attempt_ordinal, root_node_id, attempt_id, status)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_nodes_thread_root_status_private_idx
+  ON orchestration_v2_projection_nodes(thread_id, node_id, root_node_id, status)
+  WHERE status <> 'local-index-private'`;
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_run_attempts_latest_private_idx
+  ON orchestration_v2_projection_run_attempts(run_id, root_node_id, attempt_ordinal, attempt_id, status)
+  WHERE status <> 'local-index-private'`;
+  // Delegated finalization: a parent's subagent items by task ID (turnItemSubagentIds).
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_turn_items_subagent_private_idx
+  ON orchestration_v2_projection_turn_items(thread_id,
+    (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.subagentId') END),
+    ordinal, turn_item_id)
+  WHERE type = 'subagent' AND type <> 'local-index-private'`;
 });
 
 // CLI commands open the server's database from another process; migrating behind its owner changes the schema it runs on.

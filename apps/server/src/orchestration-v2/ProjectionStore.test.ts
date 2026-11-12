@@ -1301,7 +1301,7 @@ it.effect("record reads filter notification sources without dropping matching me
     assert.isTrue(
       plan.some(
         (detail) =>
-          detail.includes("local_projection_message_item_order_guarded_private_idx") &&
+          detail.includes("local_projection_message_item_order_private_idx") &&
           detail.includes("<expr>=?"),
       ),
       plan.join("\n"),

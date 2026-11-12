@@ -469,3 +469,44 @@ it.effect.each(["existing", "missing", "foreign"] as const)(
       );
     }).pipe(Effect.provide(ReadFixture.layerDatabase)),
 );
+
+// julianday('now') reads the clock, so the usage index leaves such times unkeyed: storing one must
+// not fail, and latest usage must still match main's order.
+it.effect.each(["dated", "now", "NOW"] as const)(
+  "latest token usage matches main's order with %s usage times",
+  (newest) =>
+    Effect.gen(function* () {
+      const fixture = yield* ReadFixture.seed();
+      const sql = yield* SqlClient.SqlClient;
+      const run = fixture.run(1);
+      const times = [
+        "2026-01-02T03:04:05Z",
+        newest === "dated" ? "2026-01-03T00:00:00Z" : newest,
+        "2025-12-31T00:00:00Z",
+        "not a date",
+      ];
+      for (const [index, updatedAt] of times.entries()) {
+        yield* fixture.putTurn(
+          fixture.turn(run, 80 + index, "completed", {
+            tokenUsage: { usedTokens: index + 1, updatedAt },
+          }),
+        );
+      }
+      const { providerTurns } = yield* fixture.store.getThreadRecords(
+        fixture.threadId,
+        ["providerTurns"],
+        { latestProviderTurnUsageOnly: true },
+      );
+      const main = yield* sql<{ readonly id: string }>`
+        SELECT json_extract(payload_json, '$.id') AS id
+        FROM orchestration_v2_projection_provider_turns
+        WHERE thread_id = ${fixture.threadId}
+          AND json_extract(payload_json, '$.tokenUsage') IS NOT NULL
+        ORDER BY julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) DESC,
+          provider_thread_id ASC, ordinal ASC
+        LIMIT 1
+      `;
+      expect(providerTurns.map((turn) => turn.id)).toEqual(main.map((row) => row.id));
+      expect(providerTurns.map((turn) => turn.id)).toEqual(["oracle-turn-1-81"]);
+    }).pipe(Effect.provide(ReadFixture.layerDatabase)),
+);

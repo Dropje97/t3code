@@ -199,7 +199,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("SpawnHost", ()
         child.once("message",()=>process.exit(0));
       `;
       const leader = client.spawn(process.execPath, ["-e", leaderScript], {
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "pipe", "ignore"],
         detached: true,
       });
       await NodeEvents.EventEmitter.once(leader, "exit");
@@ -301,7 +301,7 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("SpawnHost", ()
     try {
       await client.ready;
       survivor = client.spawn("sleep", ["30"], {
-        stdio: ["ignore", "ignore", "ignore"],
+        stdio: ["ignore", "pipe", "ignore"],
         detached: true,
       });
       await NodeEvents.EventEmitter.once(survivor, "spawn");
@@ -347,12 +347,14 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("host process l
       import { readFileSync } from "node:fs";
       const client = new SpawnHostClient(process.execPath, [${JSON.stringify(bin)}, "__spawn-host"], () => {});
       await client.ready;
-      const child = client.spawn("sleep", ["30"], {stdio:["ignore","ignore","ignore"],detached:true});
+      const child = client.spawn("sleep", ["30"], {stdio:["ignore","pipe","ignore"],detached:true});
       let exited = false;
       child.on("exit", () => { exited = true; });
       child.once("spawn", () => {
         const hostPid = Number(readFileSync("/proc/" + child.pid + "/stat", "utf8").split(") ")[1].split(" ")[1]);
         console.log(JSON.stringify({childPid:child.pid,hostPid}));
+        // The pipe only keeps the child hosted (all-ignore launchers bypass the host); close it.
+        child.stdout.destroy();
         child.unref();
         if (${referenced}) child.ref();
       });
@@ -386,4 +388,25 @@ describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("host process l
       }
     },
   );
+
+  it("starts fire-and-forget launchers from the caller, so they outlive the host as on main", async () => {
+    const client = new SpawnHostClient(process.execPath, [bin, "__spawn-host"], () => {});
+    let pid: number | undefined;
+    try {
+      await client.ready;
+      const child = client.spawn("sleep", ["30"], {
+        stdio: ["ignore", "ignore", "ignore"],
+        detached: true,
+      });
+      await NodeEvents.EventEmitter.once(child, "spawn");
+      pid = child.pid!;
+      const stat = NodeFS.readFileSync(`/proc/${pid}/stat`, "utf8");
+      expect(Number(stat.split(") ")[1]!.split(" ")[1])).toBe(process.pid);
+      child.unref();
+      await client.close();
+      expect(alive(pid)).toBe(true);
+    } finally {
+      if (pid !== undefined && alive(pid)) process.kill(-pid, "SIGKILL");
+    }
+  });
 });

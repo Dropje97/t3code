@@ -494,24 +494,51 @@ CREATE TRIGGER local_turn_item_counts_move
           END;
 `;
 
-const stageOneLocalIndexNames = [
+const localIndexNames = [
   "local_projection_threads_active_updated_idx",
   "local_projection_threads_pull_requests_guarded_idx",
   "local_projection_provider_turns_live_idx",
   "local_projection_turn_items_type_private_idx",
-  "local_projection_message_item_order_guarded_private_idx",
+  "local_projection_message_item_order_private_idx",
   "local_projection_threads_limit_wake_guarded_idx",
   "local_projection_runs_status_private_idx",
-  "local_projection_messages_compact_guarded_private_idx",
+  "local_projection_messages_compact_private_idx",
   "local_projection_attempts_live_private_idx",
   "local_projection_provider_turns_node_private_idx",
-  "local_projection_provider_turns_usage_guarded_private_idx",
+  "local_projection_provider_turns_usage_now_private_idx",
   "local_projection_provider_turns_attempt_private_idx",
   "local_projection_checkpoints_window_private_idx",
   "local_projection_subagents_run_private_idx",
   "local_projection_subagents_routing_private_idx",
   "local_projection_threads_worktree_guarded_idx",
+  "local_projection_turn_items_timeline_private_idx",
+  "local_projection_nodes_root_status_private_idx",
+  "local_projection_runs_timeline_metadata_private_idx",
+  "local_projection_attempts_timeline_metadata_ids_private_idx",
+  "local_projection_nodes_thread_root_status_private_idx",
+  "local_projection_run_attempts_latest_private_idx",
+  "local_projection_turn_items_subagent_private_idx",
 ];
+
+// A kept production index must have the definition startup would create: IF NOT EXISTS keeps
+// the installed one, so a changed definition needs a new name.
+const normalizedCreates = (source: string) =>
+  new Map(
+    [...source.matchAll(/CREATE INDEX IF NOT EXISTS (local_projection_\w+)([^;`]*)/g)].map(
+      (match) => [match[1]!, match[2]!.replace(/\s+/g, " ").replace(/\( /g, "(").trim()],
+    ),
+  );
+
+it("keeps the deployed definitions of retained local indexes", () => {
+  const deployed = normalizedCreates(previousLocalIndexSql);
+  const installed = normalizedCreates(
+    NodeFS.readFileSync(NodePath.join(import.meta.dirname, "Sqlite.ts"), "utf8"),
+  );
+  assert.deepEqual([...installed.keys()].toSorted(), localIndexNames.toSorted());
+  for (const [name, definition] of installed) {
+    if (deployed.has(name)) assert.equal(definition, deployed.get(name), name);
+  }
+});
 
 it.effect(
   "replaces the deployed local schema after upstream migrations and remains idempotent",
@@ -579,7 +606,7 @@ it.effect(
         `;
           assert.deepEqual(
             localIndexes.map((row) => row.name),
-            stageOneLocalIndexNames.toSorted(),
+            localIndexNames.toSorted(),
           );
           const localCounts =
             yield* sql`SELECT name FROM sqlite_schema WHERE name GLOB 'local_turn_item_counts*'`;

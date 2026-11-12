@@ -3581,6 +3581,20 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           recentRunIds === null
             ? sql``
             : sql`AND ${sql.literal(column)} IN (SELECT value FROM json_each(${recentRunIds}))`;
+        // julianday('now') is not deterministic, so the usage index leaves 'now' timestamps unkeyed;
+        // a thread holding one reads latest usage with main's unindexed query instead.
+        const usageNowFallback =
+          window === undefined &&
+          filter?.latestProviderTurnUsageOnly === true &&
+          (yield* sql<{ readonly found: number }>`
+            SELECT 1 AS found FROM orchestration_v2_projection_provider_turns
+              INDEXED BY local_projection_provider_turns_usage_now_private_idx
+            WHERE thread_id = ${threadId} AND status <> 'local-index-private'
+              AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL
+              AND (CASE WHEN json_valid(payload_json) AND lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) IS NOT 'now' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) IS NULL
+              AND (CASE WHEN json_valid(payload_json) THEN lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) = 'now'
+            LIMIT 1
+          `).length > 0;
         // Without the hint SQLite reads every row of the thread to find the recent runs' rows.
         const recentRunIndex = (index: string) =>
           recentRunIds === null
@@ -4126,7 +4140,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 filter?.runningProviderTurnsOnly === true
                   ? sql`INDEXED BY local_projection_provider_turns_live_idx`
                   : filter?.latestProviderTurnUsageOnly === true
-                    ? sql`INDEXED BY local_projection_provider_turns_usage_guarded_private_idx`
+                    ? usageNowFallback
+                      ? sql``
+                      : sql`INDEXED BY local_projection_provider_turns_usage_now_private_idx`
                     : filter?.providerTurnAttemptIds !== undefined || recentRunIds !== null
                       ? sql`INDEXED BY local_projection_provider_turns_attempt_private_idx`
                       : sql``
@@ -4151,8 +4167,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ${filter?.providerTurnThreadIds === undefined ? sql`` : sql`AND provider_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.providerTurnThreadIds)}))`}
               ${
                 filter?.latestProviderTurnUsageOnly === true
-                  ? sql`AND status <> 'local-index-private' AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL
-            ORDER BY (CASE WHEN json_valid(payload_json) THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
+                  ? usageNowFallback
+                    ? sql`AND json_extract(payload_json, '$.tokenUsage') IS NOT NULL
+            ORDER BY julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) DESC,
+              provider_thread_id ASC, ordinal ASC
+            LIMIT 1`
+                    : sql`AND status <> 'local-index-private' AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL
+            ORDER BY (CASE WHEN json_valid(payload_json) AND lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) IS NOT 'now' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
               provider_thread_id ASC, ordinal ASC
             LIMIT 1`
                   : sql`ORDER BY provider_thread_id ASC, ordinal ASC`
@@ -4412,13 +4433,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ? undefined
               : messages.map((message) => message.id);
           const rows = yield* sql<{ message_id: string; ordinal: number }>`
-            SELECT (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.messageId') END) AS message_id, MIN(ordinal) AS ordinal
+            SELECT json_extract(payload_json, '$.messageId') AS message_id, MIN(ordinal) AS ordinal
             FROM orchestration_v2_projection_turn_items
-              INDEXED BY local_projection_message_item_order_guarded_private_idx
+              INDEXED BY local_projection_message_item_order_private_idx
             WHERE thread_id = ${threadId} AND type IN ('user_message','assistant_message') AND type <> 'local-index-private'
               AND ${userOnly ? sql`type = 'user_message'` : sql`type IN ('user_message', 'assistant_message')`}
-              ${loadedMessageIds === undefined ? sql`` : sql`AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.messageId') END) IN (SELECT value FROM json_each(${encodeIdList(loadedMessageIds)}))`}
-            GROUP BY (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.messageId') END)
+              ${loadedMessageIds === undefined ? sql`` : sql`AND json_extract(payload_json, '$.messageId') IN (SELECT value FROM json_each(${encodeIdList(loadedMessageIds)}))`}
+            GROUP BY json_extract(payload_json, '$.messageId')
           `;
           for (const row of rows) messageOrdinals.set(row.message_id, row.ordinal);
         }
@@ -5252,26 +5273,26 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                   WHERE thread_id = ${threadId} AND run_id = ${runId})
                 UNION
                 SELECT rowid FROM orchestration_v2_projection_messages
-                  INDEXED BY local_projection_messages_compact_guarded_private_idx
+                  INDEXED BY local_projection_messages_compact_private_idx
                 WHERE thread_id = ${threadId} AND role = 'user'
                   AND role <> 'local-index-private'
-                  AND lower(trim((CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.text') END), char(9, 10, 11, 12, 13, 32, 160,
+                  AND lower(trim(json_extract(payload_json, '$.text'), char(9, 10, 11, 12, 13, 32, 160,
                     5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233,
                     8239, 8287, 12288, 65279))) = '/compact'
                 -- Earlier /goal turns defer context too; parseGoalCommand narrows this prefix match.
                 -- The lowercased index key bounds the case-sensitive prefix test to a range seek.
                 UNION
                 SELECT rowid FROM orchestration_v2_projection_messages
-                  INDEXED BY local_projection_messages_compact_guarded_private_idx
+                  INDEXED BY local_projection_messages_compact_private_idx
                 WHERE thread_id = ${threadId} AND role = 'user'
                   AND role <> 'local-index-private'
-                  AND lower(trim((CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.text') END), char(9, 10, 11, 12, 13, 32, 160,
+                  AND lower(trim(json_extract(payload_json, '$.text'), char(9, 10, 11, 12, 13, 32, 160,
                     5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233,
                     8239, 8287, 12288, 65279))) >= '/goal'
-                  AND lower(trim((CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.text') END), char(9, 10, 11, 12, 13, 32, 160,
+                  AND lower(trim(json_extract(payload_json, '$.text'), char(9, 10, 11, 12, 13, 32, 160,
                     5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233,
                     8239, 8287, 12288, 65279))) < '/goam'
-                  AND trim((CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.text') END), char(9, 10, 11, 12, 13, 32, 160,
+                  AND trim(json_extract(payload_json, '$.text'), char(9, 10, 11, 12, 13, 32, 160,
                     5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233,
                     8239, 8287, 12288, 65279)) GLOB '/goal*'
               ) ORDER BY created_at ASC, message_id ASC
@@ -6332,11 +6353,11 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             // a replay or steer linked it to a different run (or to no run).
             const rows = yield* sql<PayloadRow>`
           SELECT payload_json FROM orchestration_v2_projection_turn_items
-            INDEXED BY local_projection_message_item_order_guarded_private_idx
+            INDEXED BY local_projection_message_item_order_private_idx
           WHERE thread_id = ${threadId}
             AND type IN ('user_message','assistant_message') AND type <> 'local-index-private'
             AND type = 'user_message'
-            AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.messageId') END) = ${messageId}
+            AND json_extract(payload_json, '$.messageId') = ${messageId}
           ORDER BY ordinal ASC, turn_item_id ASC
         `;
             const turnItems = yield* decodeRows(decodeTurnItemPayload, threadId)(rows);

@@ -214,6 +214,16 @@ export class SpawnHostClient {
     args: ReadonlyArray<string>,
     options: NodeChildProcess.SpawnOptions,
   ): NodeChildProcessSpawner.SpawnedChildProcess => {
+    // A spawn with every stdio ignored is a fire-and-forget launcher (editor, browser) that main lets
+    // outlive the server once unreferenced. The host kills its children on shutdown or disconnect,
+    // so these start from the server, as on main.
+    if (
+      Array.isArray(options.stdio) &&
+      options.stdio.length > 0 &&
+      options.stdio.every((fd) => fd === "ignore")
+    ) {
+      return NodeChildProcess.spawn(command, [...args], options);
+    }
     if (
       this.#closed ||
       !this.#ready ||
