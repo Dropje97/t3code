@@ -80,7 +80,7 @@ import {
 } from "@t3tools/contracts";
 import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
-import { modelSwitchSince } from "./modelSwitch.ts";
+import { isShownUserItem, modelSwitchSince } from "./modelSwitch.ts";
 import { combinePullRequestWatchWakes, type PullRequestWatchWake } from "./pullRequestWatch.ts";
 import { recordThreadOpen } from "@t3tools/shared/paletteSearch";
 import {
@@ -173,6 +173,8 @@ import {
   type ActiveShellIndexEntry,
   type OlderSettledThreadsQuery,
   type ShellSnapshotOptions,
+  type ProjectionControlSnapshot,
+  type ProjectionStoreV2Error,
 } from "./ProjectionStore.ts";
 import { ProviderAdapterRegistryV2 } from "./ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -1331,6 +1333,96 @@ function rootProviderThreadsForProvider(
     );
 }
 
+// Command reads omit settled tasks and settled leaf nodes; a dispatcher thread keeps thousands of
+// delivered tasks, each carrying its full prompt.
+const COMMAND_PROJECTION_FIELDS = [
+  "runs",
+  "attempts",
+  "nodes",
+  "subagents",
+  "providerSessions",
+  "providerThreads",
+  "providerTurns",
+  "runtimeRequests",
+  "messages",
+  "turnItems",
+  "checkpointScopes",
+  "contextTransfers",
+] as const satisfies ReadonlyArray<ProjectionRecordField>;
+const COMMAND_PROJECTION_FILTER = {
+  turnItemTypes: ["user_message", "error"],
+  messageRoles: ["user"],
+  omitSettledLeafNodes: true,
+  // Commands here read only undelivered or active tasks; a dispatcher thread keeps
+  // thousands of delivered ones, each carrying its full prompt.
+  omitSettledSubagents: true,
+  // No command reads a settled task's node or its child's provider thread.
+  omitSettledSubagentRecords: true,
+  // Commands act on pending forks and merge-backs only; consumed ones stay unread.
+  contextTransferStatuses: ["pending"],
+} as const satisfies ProjectionRecordFilter;
+
+function toCommandProjection(
+  records: ProjectionRecords<(typeof COMMAND_PROJECTION_FIELDS)[number]>,
+): OrchestrationV2ThreadProjection {
+  return {
+    ...records,
+    checkpoints: [],
+    plans: [],
+    contextHandoffs: [],
+    visibleTurnItems: [],
+    updatedAt: records.thread.updatedAt,
+  };
+}
+
+/*
+ * Local t3-code-nightly patch: staged command reads. The broad command read takes 10-25 s on a
+ * thread with 7k runs. Staged reads keep the thread, every run and the broad read's small record
+ * kinds, read the attempts, nodes, provider turns, messages and turn items that eligible branches
+ * consume by key, and take the broad read otherwise. `off` restores the broad reads.
+ */
+const STAGED_COMMAND_READS = process.env.T3CODE_LOCAL_STAGED_COMMAND_READS !== "off";
+// Read in full by both paths; the filter is the broad read's.
+const STAGED_BASE_FIELDS = [
+  "runs",
+  "subagents",
+  "providerSessions",
+  "providerThreads",
+  "runtimeRequests",
+  "checkpointScopes",
+  "contextTransfers",
+] as const satisfies ReadonlyArray<ProjectionRecordField>;
+
+/** Continuations, steer follow-ups, idle compactions and goal commands keep the broad read. */
+function messageDispatchReadsControls(
+  command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
+): boolean {
+  return (
+    STAGED_COMMAND_READS &&
+    command.manualContinuationOfRunId === undefined &&
+    command.usageLimitContinuationOfRunId === undefined &&
+    command.restartContinuationOfRunId === undefined &&
+    command.steerFollowUpOfRunId === undefined &&
+    command.idleCompaction === undefined &&
+    parseGoalCommand(command) === null
+  );
+}
+
+function uniqueIds<T extends string>(ids: Iterable<T | null>): Array<T> {
+  return [...new Set([...ids].filter((id): id is T => id !== null))];
+}
+
+/** The broad read's turn item order: (ordinal, id in SQLite's UTF-8 byte order), no duplicates. */
+function canonicalTurnItems(
+  items: ReadonlyArray<OrchestrationV2TurnItem>,
+): Array<OrchestrationV2TurnItem> {
+  return [...new Map(items.map((item) => [item.id, item])).values()].toSorted((left, right) =>
+    left.ordinal !== right.ordinal
+      ? left.ordinal - right.ordinal
+      : Buffer.compare(Buffer.from(left.id, "utf8"), Buffer.from(right.id, "utf8")),
+  );
+}
+
 function isHandoffSourceRun(run: OrchestrationV2Run): boolean {
   return (
     run.status === "completed" ||
@@ -1551,47 +1643,235 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     recent?: ProjectionRecordFilter["sinceLastCompaction"],
   ) =>
     projectionStore
-      .getThreadRecords(
-        threadId,
-        [
-          "runs",
-          "attempts",
-          "nodes",
-          "subagents",
-          "providerSessions",
-          "providerThreads",
-          "providerTurns",
-          "runtimeRequests",
-          "messages",
-          "turnItems",
-          "checkpointScopes",
-          "contextTransfers",
-        ],
-        {
-          turnItemTypes: ["user_message", "error"],
-          messageRoles: ["user"],
-          omitSettledLeafNodes: true,
-          // Commands here read only undelivered or active tasks; a dispatcher thread keeps
-          // thousands of delivered ones, each carrying its full prompt.
-          omitSettledSubagents: true,
-          // No command reads a settled task's node or its child's provider thread.
-          omitSettledSubagentRecords: true,
-          // Commands act on pending forks and merge-backs only; consumed ones stay unread.
-          contextTransferStatuses: ["pending"],
-          ...(recent === undefined ? {} : { sinceLastCompaction: recent }),
-        },
-      )
+      .getThreadRecords(threadId, COMMAND_PROJECTION_FIELDS, {
+        ...COMMAND_PROJECTION_FILTER,
+        ...(recent === undefined ? {} : { sinceLastCompaction: recent }),
+      })
       .pipe(
-        Effect.map((records): OrchestrationV2ThreadProjection => ({
-          ...records,
-          checkpoints: [],
-          plans: [],
-          contextHandoffs: [],
-          visibleTurnItems: [],
-          updatedAt: records.thread.updatedAt,
-        })),
+        Effect.map(toCommandProjection),
         Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
       );
+
+  /**
+   * The user items of the run that modelSwitchSince picks: the latest run, by runRanAfter, that
+   * has a context handoff (no items needed) or a shown user item. Runs ranked above it have no
+   * shown item, so these items and all runs give modelSwitchSince the same winner.
+   */
+  const shownBaselineItems = Effect.fnUntraced(function* (
+    snapshot: ProjectionControlSnapshot,
+    runs: ReadonlyArray<OrchestrationV2Run>,
+  ) {
+    // Ordinals are unique per thread, so runRanAfter is a strict total order.
+    const ranked = runs
+      .filter((run) => run.status !== "rolled_back" && run.status !== "queued")
+      .toSorted((left, right) => (runRanAfter(left, right) ? -1 : 1));
+    const itemsByMessage = new Map<MessageId, Array<OrchestrationV2TurnItem>>();
+    for (const [index, run] of ranked.entries()) {
+      if (run.contextHandoffId !== null) return [];
+      if (!itemsByMessage.has(run.userMessageId)) {
+        const batch = uniqueIds(ranked.slice(index).map((candidate) => candidate.userMessageId))
+          .filter((messageId) => !itemsByMessage.has(messageId))
+          .slice(0, 8);
+        for (const messageId of batch) itemsByMessage.set(messageId, []);
+        for (const item of yield* snapshot.userItemsForMessages(batch)) {
+          if (item.type === "user_message") itemsByMessage.get(item.messageId)?.push(item);
+        }
+      }
+      const items = itemsByMessage.get(run.userMessageId) ?? [];
+      if (items.some(isShownUserItem)) return items;
+    }
+    return [];
+  });
+
+  /**
+   * Local t3-code-nightly patch: the command projection of an eligible message dispatch, or
+   * undefined where a branch needs the broad read: imports, forks, merges, and provider or model
+   * changes. Returns what each remaining branch reads; the rest stays empty.
+   */
+  const readMessageDispatchControls = (
+    command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
+  ) =>
+    projectionStore.readControlSnapshot(command.threadId, (snapshot) =>
+      Effect.gen(function* () {
+        const base = yield* snapshot.records(STAGED_BASE_FIELDS, COMMAND_PROJECTION_FILTER);
+        const { thread } = base;
+        const desired = command.modelSelection ?? thread.modelSelection;
+        const explicitTargetId =
+          command.dispatchMode.type === "steer_active" ||
+          command.dispatchMode.type === "restart_active"
+            ? command.dispatchMode.targetRunId
+            : undefined;
+        // Every run a branch can steer, restart, stop or queue behind.
+        const targetRuns = base.runs.filter(
+          (run) => isActiveRun(run) || run.id === explicitTargetId,
+        );
+        const activeProviderThread = base.providerThreads.find(
+          (candidate) => candidate.id === thread.activeProviderThreadId,
+        );
+        if (
+          thread.historyOrigin === "v1_import" ||
+          pendingForkTransferForThread(base) !== undefined ||
+          pendingMergeBackTransfersForThread(base).length > 0 ||
+          !modelSelectionsEqual(desired, thread.modelSelection) ||
+          (activeProviderThread !== undefined &&
+            activeProviderThread.providerInstanceId !== desired.instanceId) ||
+          targetRuns.some(
+            (run) =>
+              run.providerInstanceId !== desired.instanceId ||
+              !modelSelectionsEqual(run.modelSelection, desired),
+          )
+        ) {
+          return undefined;
+        }
+        const { messages } = yield* snapshot.records(["messages"], {
+          messageIds: uniqueIds([
+            ...targetRuns.map((run) => run.userMessageId),
+            ...base.runs.filter((run) => run.status === "queued").map((run) => run.userMessageId),
+            command.messageId,
+          ]),
+          messageRoles: COMMAND_PROJECTION_FILTER.messageRoles,
+        });
+        // A redelivered completion checks the turns of the run its message already joined.
+        const mailboxRun = base.runs.find(
+          (run) =>
+            run.id === messages.find((message) => message.id === command.messageId)?.runId,
+        );
+        const rootIds = uniqueIds(targetRuns.map((run) => run.rootNodeId));
+        const attemptIds = uniqueIds(targetRuns.map((run) => run.activeAttemptId));
+        // Root turns are never settled leaves or task nodes, so the broad filter keeps them all.
+        const { nodes } = yield* snapshot.records(["nodes"], { nodeIds: rootIds });
+        // Active attempts, and every attempt of the targets for a restart's next ordinal.
+        const attempts = yield* snapshot.attempts({
+          attemptIds,
+          runIds: targetRuns.map((run) => run.id),
+        });
+        // A null active attempt matches turns of no attempt in the steering checks.
+        const providerTurns = yield* snapshot.providerTurns({
+          attemptIds: uniqueIds([...attemptIds, mailboxRun?.activeAttemptId ?? null]),
+          includeNullAttempt: targetRuns.some((run) => run.activeAttemptId === null),
+          nodeIds: rootIds,
+        });
+        const linkedItems = yield* snapshot.userItemsForMessages([command.messageId]);
+        const baselineItems = yield* shownBaselineItems(snapshot, base.runs);
+        return toCommandProjection({
+          ...base,
+          attempts,
+          nodes,
+          providerTurns,
+          messages,
+          turnItems: canonicalTurnItems([...linkedItems, ...baselineItems]),
+        });
+      }),
+    );
+
+  /**
+   * Local t3-code-nightly patch: the command projection of a queued start, or undefined where it
+   * needs the broad read: imports and provider or model changes, which can hand context off.
+   * Covers every queued run, since cancellations move the start to the next one.
+   */
+  const readQueuedStartControls = (threadId: ThreadId, focusRunId: RunId | undefined) =>
+    projectionStore.readControlSnapshot(threadId, (snapshot) =>
+      Effect.gen(function* () {
+        const base = yield* snapshot.records(STAGED_BASE_FIELDS, COMMAND_PROJECTION_FILTER);
+        const queuedRuns = base.runs.filter((run) => run.status === "queued");
+        const { messages } = yield* snapshot.records(["messages"], {
+          messageIds: uniqueIds(queuedRuns.map((run) => run.userMessageId)),
+          messageRoles: COMMAND_PROJECTION_FILTER.messageRoles,
+        });
+        const seed = toCommandProjection({
+          ...base,
+          attempts: [],
+          nodes: [],
+          providerTurns: [],
+          messages,
+          turnItems: [],
+        });
+        const { thread } = seed;
+        // The caller returns before reading anything else.
+        if (thread.archivedAt !== null || thread.deletedAt !== null || seed.runs.some(isActiveRun)) {
+          return seed;
+        }
+        const queued =
+          focusRunId === undefined
+            ? nextQueuedRun(seed)
+            : seed.runs.find((run) => run.id === focusRunId && run.status === "queued");
+        if (queued !== undefined) {
+          const modelSelection = queuedRunModelSelection(seed, queued);
+          const activeProviderThread = seed.providerThreads.find(
+            (candidate) => candidate.id === thread.activeProviderThreadId,
+          );
+          const storedProviderThread = seed.providerThreads.find(
+            (candidate) => candidate.id === queued.providerThreadId,
+          );
+          const latestHandoffRun = seed.runs.findLast(isHandoffSourceRun);
+          if (
+            thread.historyOrigin === "v1_import" ||
+            !modelSelectionsEqual(modelSelection, thread.modelSelection) ||
+            (activeProviderThread !== undefined &&
+              activeProviderThread.providerInstanceId !== modelSelection.instanceId) ||
+            (storedProviderThread !== undefined &&
+              storedProviderThread.providerInstanceId !== modelSelection.instanceId) ||
+            (latestHandoffRun !== undefined &&
+              latestHandoffRun.providerInstanceId !== modelSelection.instanceId)
+          ) {
+            return undefined;
+          }
+        }
+        // Cancelling a stale queued run, held or not, updates its root node and attempt.
+        const { nodes } = yield* snapshot.records(["nodes"], {
+          nodeIds: uniqueIds(queuedRuns.map((run) => run.rootNodeId)),
+        });
+        const attempts = yield* snapshot.attempts({
+          attemptIds: uniqueIds(queuedRuns.map((run) => run.activeAttemptId)),
+          runIds: [],
+        });
+        // Failure and usage-limit holds read the errors of the latest executed run, overall and
+        // on each queued run's provider.
+        const errorRunIds = uniqueIds(
+          [
+            seed.runs,
+            ...queuedRuns.map((run) => {
+              const instanceId = queuedRunModelSelection(seed, run).instanceId;
+              return seed.runs.filter((candidate) => candidate.providerInstanceId === instanceId);
+            }),
+          ].map((runs) => {
+            const executed = latestExecutedRun(runs);
+            return executed?.status === "failed" ? executed.id : null;
+          }),
+        );
+        const errorItems =
+          errorRunIds.length === 0
+            ? []
+            : (yield* snapshot.records(["turnItems"], {
+                turnItemTypes: ["error"],
+                turnItemRunIds: errorRunIds,
+              })).turnItems;
+        const linkedItems = yield* snapshot.userItemsForMessages(
+          uniqueIds(queuedRuns.map((run) => run.userMessageId)),
+        );
+        const baselineItems = yield* shownBaselineItems(snapshot, seed.runs);
+        return {
+          ...seed,
+          nodes,
+          attempts,
+          turnItems: canonicalTurnItems([...errorItems, ...linkedItems, ...baselineItems]),
+        };
+      }),
+    );
+
+  /** A failed staged read takes the broad read, which reports its own errors. */
+  const stagedOrBroad = (
+    threadId: ThreadId,
+    staged: Effect.Effect<OrchestrationV2ThreadProjection | undefined, ProjectionStoreV2Error>,
+  ) =>
+    staged.pipe(
+      Effect.catch((cause) =>
+        Effect.logWarning("Staged command read failed; reading the full projection", {
+          threadId,
+          cause,
+        }).pipe(Effect.as(undefined)),
+      ),
+    );
 
   // Command reads omit settled tasks, but a completion notice counts its whole cohort.
   const notificationTasks = (
@@ -2220,7 +2500,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       },
     ) {
       if (!(yield* projectionStore.canStartQueuedRun(threadId))) return;
-      let projection = yield* readCommandProjection(threadId);
+      // Local t3-code-nightly patch: staged reads, focused on the run each read selects next.
+      const readQueuedStart = Effect.fnUntraced(function* (focusRunId: RunId | undefined) {
+        const staged = STAGED_COMMAND_READS
+          ? yield* stagedOrBroad(threadId, readQueuedStartControls(threadId, focusRunId))
+          : undefined;
+        return staged ?? (yield* readCommandProjection(threadId));
+      });
+      let projection = yield* readQueuedStart(options?.queuedRunId);
       if (
         projection.thread.archivedAt !== null ||
         projection.thread.deletedAt !== null ||
@@ -2230,7 +2517,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
 
       if (yield* cancelStaleQuestionWakes(projection)) {
-        projection = yield* readCommandProjection(threadId);
+        projection = yield* readQueuedStart(options?.queuedRunId);
       }
       let storedQueuedRun =
         options?.queuedRunId === undefined
@@ -2245,7 +2532,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         yield* writeSystemEvents(
           queuedRunCancellationEvents(projection, storedQueuedRun, yield* DateTime.now),
         );
-        projection = yield* readCommandProjection(threadId);
+        projection = yield* readQueuedStart(undefined);
         storedQueuedRun = nextQueuedRun(projection);
       }
       // A wake that outlived some of its pull requests tells only the current ones.
@@ -2267,7 +2554,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           },
         ]);
         const runId = storedQueuedRun.id;
-        projection = yield* readCommandProjection(threadId);
+        projection = yield* readQueuedStart(runId);
         storedQueuedRun = projection.runs.find((run) => run.id === runId);
       }
       if (storedQueuedRun === undefined) {
@@ -6385,10 +6672,17 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
+    // Local t3-code-nightly patch: staged reads unless a pending event of this thread could change
+    // them; they fall back to the broad read where a branch needs it.
+    const staged =
+      messageDispatchReadsControls(command) &&
+      !(yield* Ref.get(events)).some((event) => event.threadId === command.threadId)
+        ? yield* stagedOrBroad(command.threadId, readMessageDispatchControls(command))
+        : undefined;
     // A compacted thread reads every run and turn item, but attempts, nodes, messages and provider
     // turns only for its recent runs and the runs this command names. An idle compaction reads
     // in full: its busy check below looks for a delegated result's message under any old run.
-    let projection = yield* getProjectionWithPendingEvents(
+    let projection = staged ?? (yield* getProjectionWithPendingEvents(
       command.threadId,
       events,
       command.idleCompaction === undefined
@@ -6406,7 +6700,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             keepMessageId: command.messageId,
           }
         : undefined,
-    );
+    ));
     if (command.steerFollowUpOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.steerFollowUpOfRunId);
       if (

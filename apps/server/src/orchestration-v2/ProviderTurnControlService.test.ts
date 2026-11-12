@@ -210,6 +210,7 @@ it.effect(
         ProjectionStore.ProjectionStoreV2.of({
           getProviderContinuationState: () => Effect.die("unused getProviderContinuationState"),
           getSentMessageState: () => Effect.die("unused getSentMessageState"),
+          readControlSnapshot: () => Effect.die("unused readControlSnapshot"),
           apply: () => Effect.void,
           getLimitRecoveryCandidates: () => Effect.die("unused getLimitRecoveryCandidates"),
           getLimitRecoveryWakeAt: () => Effect.die("unused getLimitRecoveryWakeAt"),

@@ -426,6 +426,35 @@ export type ProjectionRecords<K extends ProjectionRecordField> = Pick<
   "thread" | K
 >;
 
+/**
+ * Local t3-code-nightly patch: keyed command reads in one snapshot, for staged message dispatch and
+ * queued starts. Orders match the broad command read's for the same rows.
+ */
+export interface ProjectionControlSnapshot {
+  readonly records: <K extends ProjectionRecordField>(
+    fields: ReadonlyArray<K>,
+    filter?: ProjectionRecordFilter,
+  ) => Effect.Effect<ProjectionRecords<K>, ProjectionStoreV2Error>;
+  /** User items linked to these messages, in (ordinal, id) order. */
+  readonly userItemsForMessages: (
+    messageIds: ReadonlyArray<MessageId>,
+  ) => Effect.Effect<ReadonlyArray<OrchestrationV2TurnItem>, ProjectionStoreV2Error>;
+  /** Attempts by ID and every attempt of the given runs. */
+  readonly attempts: (input: {
+    readonly attemptIds: ReadonlyArray<RunAttemptId>;
+    readonly runIds: ReadonlyArray<RunId>;
+  }) => Effect.Effect<
+    ReadonlyArray<OrchestrationV2ThreadProjection["attempts"][number]>,
+    ProjectionStoreV2Error
+  >;
+  /** Turns of the given attempts (and of no attempt) and of the given nodes. */
+  readonly providerTurns: (input: {
+    readonly attemptIds: ReadonlyArray<RunAttemptId>;
+    readonly includeNullAttempt: boolean;
+    readonly nodeIds: ReadonlyArray<NodeId>;
+  }) => Effect.Effect<ReadonlyArray<OrchestrationV2ProviderTurn>, ProjectionStoreV2Error>;
+}
+
 export interface ProjectionTimelinePageOptions {
   readonly afterPosition?: number;
   readonly itemId?: TurnItemId;
@@ -542,6 +571,11 @@ export interface ProjectionStoreV2Shape {
     fields: ReadonlyArray<K>,
     filter?: ProjectionRecordFilter,
   ) => Effect.Effect<ProjectionRecords<K>, ProjectionStoreV2Error>;
+  /** Local t3-code-nightly patch: runs `read` in one read snapshot of the thread. */
+  readonly readControlSnapshot: <A>(
+    threadId: ThreadId,
+    read: (snapshot: ProjectionControlSnapshot) => Effect.Effect<A, ProjectionStoreV2Error>,
+  ) => Effect.Effect<A, ProjectionStoreV2Error>;
 
   readonly apply: (
     event: OrchestrationV2DomainEvent,
@@ -6600,6 +6634,89 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.mapError(controlReadError(threadId)),
       );
 
+    const readControlSnapshot: ProjectionStoreV2Shape["readControlSnapshot"] = (threadId, read) => {
+      const snapshot: ProjectionControlSnapshot = {
+        records: (fields, filter) =>
+          readCanonicalProjection(threadId, undefined, fields, filter).pipe(
+            Effect.map(
+              (projection) =>
+                Object.fromEntries([
+                  ["thread", projection.thread],
+                  ...fields.map((field) => [field, projection[field]]),
+                ]) as ProjectionRecords<(typeof fields)[number]>,
+            ),
+            Effect.mapError(controlReadError(threadId)),
+          ),
+        userItemsForMessages: (messageIds) =>
+          messageIds.length === 0
+            ? Effect.succeed([])
+            : sql<PayloadRow>`
+                SELECT payload_json FROM orchestration_v2_projection_turn_items
+                  INDEXED BY local_projection_message_item_order_private_idx
+                WHERE thread_id = ${threadId}
+                  AND json_extract(payload_json, '$.messageId')
+                    IN (SELECT value FROM json_each(${encodeIdList(messageIds)}))
+                  AND type IN ('user_message', 'assistant_message')
+                  AND type <> 'local-index-private'
+                  AND type = 'user_message'
+                ORDER BY ordinal ASC, turn_item_id ASC
+              `.pipe(
+                Effect.flatMap(decodeRows(decodeTurnItemPayload, threadId)),
+                Effect.mapError(controlReadError(threadId)),
+              ),
+        attempts: ({ attemptIds, runIds }) =>
+          attemptIds.length === 0 && runIds.length === 0
+            ? Effect.succeed([])
+            : sql<PayloadRow>`
+                SELECT payload_json FROM orchestration_v2_projection_run_attempts
+                WHERE rowid IN (
+                  SELECT rowid FROM orchestration_v2_projection_run_attempts
+                    INDEXED BY sqlite_autoindex_orchestration_v2_projection_run_attempts_1
+                  WHERE thread_id = ${threadId}
+                    AND attempt_id IN (SELECT value FROM json_each(${encodeIdList(attemptIds)}))
+                  UNION
+                  SELECT rowid FROM orchestration_v2_projection_run_attempts
+                    INDEXED BY orchestration_v2_projection_run_attempts_run_ordinal_idx
+                  WHERE thread_id = ${threadId}
+                    AND run_id IN (SELECT value FROM json_each(${encodeIdList(runIds)})))
+                ORDER BY run_id ASC, attempt_ordinal ASC
+              `.pipe(
+                Effect.flatMap(decodeRows(decodeRunAttemptPayload, threadId)),
+                Effect.mapError(controlReadError(threadId)),
+              ),
+        providerTurns: ({ attemptIds, includeNullAttempt, nodeIds }) =>
+          attemptIds.length === 0 && !includeNullAttempt && nodeIds.length === 0
+            ? Effect.succeed([])
+            : sql<PayloadRow>`
+                SELECT payload_json FROM orchestration_v2_projection_provider_turns
+                WHERE rowid IN (
+                  SELECT rowid FROM orchestration_v2_projection_provider_turns
+                    INDEXED BY local_projection_provider_turns_attempt_private_idx
+                  WHERE thread_id = ${threadId} AND status <> 'local-index-private'
+                    AND run_attempt_id IN (SELECT value FROM json_each(${encodeIdList(attemptIds)}))
+                  ${
+                    includeNullAttempt
+                      ? sql`UNION
+                  SELECT rowid FROM orchestration_v2_projection_provider_turns
+                    INDEXED BY local_projection_provider_turns_attempt_private_idx
+                  WHERE thread_id = ${threadId} AND status <> 'local-index-private'
+                    AND run_attempt_id IS NULL`
+                      : sql``
+                  }
+                  UNION
+                  SELECT rowid FROM orchestration_v2_projection_provider_turns
+                    INDEXED BY local_projection_provider_turns_node_private_idx
+                  WHERE thread_id = ${threadId} AND status <> 'local-index-private'
+                    AND node_id IN (SELECT value FROM json_each(${encodeIdList(nodeIds)})))
+                ORDER BY provider_thread_id ASC, ordinal ASC
+              `.pipe(
+                Effect.flatMap(decodeRows(decodeProviderTurnPayload, threadId)),
+                Effect.mapError(controlReadError(threadId)),
+              ),
+      };
+      return sql.withTransaction(read(snapshot)).pipe(Effect.mapError(controlReadError(threadId)));
+    };
+
     const getThreadSnapshot: ProjectionStoreV2Shape["getThreadSnapshot"] = (threadId) =>
       sql
         .withTransaction(
@@ -9191,6 +9308,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getMessagesById: readOnReader(getMessagesById),
       getThreadRecords: (threadId, fields, filter) =>
         getThreadRecords(threadId, fields, filter).pipe(NodeSqliteClient.readOnly),
+      readControlSnapshot: (threadId, read) =>
+        readControlSnapshot(threadId, read).pipe(NodeSqliteClient.readOnly),
       getRuntimeRequest: readOnReader(getRuntimeRequest),
       getPlan: readOnReader(getPlan),
       getProviderControlContext: readOnReader(getProviderControlContext),
