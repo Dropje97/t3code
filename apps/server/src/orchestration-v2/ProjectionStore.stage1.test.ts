@@ -470,9 +470,9 @@ it.effect.each(["existing", "missing", "foreign"] as const)(
     }).pipe(Effect.provide(ReadFixture.layerDatabase)),
 );
 
-// julianday('now') reads the clock, so the usage index leaves such times unkeyed: storing one must
-// not fail, and latest usage must still match main's order.
-it.effect.each(["dated", "now", "NOW"] as const)(
+// julianday of 'now', 'subsec' or 'subsecond' reads the clock, so the usage index leaves such times
+// unkeyed: storing one must not fail, and latest usage must still match main's order.
+it.effect.each(["dated", "now", "NOW", "subsec", "subsecond"] as const)(
   "latest token usage matches main's order with %s usage times",
   (newest) =>
     Effect.gen(function* () {

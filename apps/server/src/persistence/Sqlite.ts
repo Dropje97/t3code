@@ -61,7 +61,7 @@ const LOCAL_READ_INDEX_NAMES = [
   "local_projection_messages_compact_private_idx",
   "local_projection_attempts_live_private_idx",
   "local_projection_provider_turns_node_private_idx",
-  "local_projection_provider_turns_usage_now_private_idx",
+  "local_projection_provider_turns_usage_dated_private_idx",
   "local_projection_provider_turns_attempt_private_idx",
   "local_projection_checkpoints_window_private_idx",
   "local_projection_subagents_run_private_idx",
@@ -155,10 +155,11 @@ const setupLocalReadIndexes = Effect.gen(function* () {
   yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_node_private_idx
   ON orchestration_v2_projection_provider_turns(thread_id, node_id)
   WHERE status <> 'local-index-private'`;
-  // julianday('now') is not deterministic, so an index may not evaluate it; 'now' rows stay unkeyed.
-  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_usage_now_private_idx
+  // julianday of 'now', 'subsec' or 'subsecond' reads the clock, which an index may not evaluate.
+  // Times that start with a digit are fixed dates or day numbers; other rows stay unkeyed.
+  yield* sql`CREATE INDEX IF NOT EXISTS local_projection_provider_turns_usage_dated_private_idx
   ON orchestration_v2_projection_provider_turns(thread_id,
-    (CASE WHEN json_valid(payload_json) AND lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) IS NOT 'now' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
+    (CASE WHEN json_valid(payload_json) AND substr(json_extract(payload_json, '$.tokenUsage.updatedAt'), 1, 1) BETWEEN '0' AND '9' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
     provider_thread_id, ordinal)
   WHERE status <> 'local-index-private' AND (CASE WHEN json_valid(payload_json)
     THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL`;

@@ -55341,7 +55341,7 @@ exports[`retains initial user/error ordinal floor across provider update: move-e
               "messageId": "race-message",
               "nativeItemRef": null,
               "nodeId": "node:run:run%3Athread%3Aoracle-thread%3Aordinal%3A6:root",
-              "ordinal": 51,
+              "ordinal": 901,
               "parentItemId": null,
               "providerThreadId": "provider:oracle-thread",
               "providerTurnId": null,

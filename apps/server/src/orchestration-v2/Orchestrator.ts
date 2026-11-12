@@ -987,14 +987,33 @@ function monitorPullRequestStamps(
   return [source.pullRequest, ...(source.otherPullRequests ?? [])];
 }
 
+function pullRequestWatchLink(
+  thread: OrchestrationV2ThreadProjection["thread"],
+  stamp: MonitorPullRequestStamp,
+) {
+  return threadPullRequestsOf(thread).find(
+    (candidate) =>
+      candidate.source !== "stack-dismissed" && threadPullRequestKeysEqual(candidate, stamp),
+  );
+}
+
+/**
+ * Local t3-code-nightly patch: whether isStalePullRequestWatchStamp reads the thread's earlier
+ * notices for this stamp, which only the broad command read holds.
+ */
+function pullRequestWakeReadsEndedWatchNotices(
+  thread: OrchestrationV2ThreadProjection["thread"],
+  stamp: MonitorPullRequestStamp,
+): boolean {
+  const link = pullRequestWatchLink(thread, stamp);
+  return stamp.watchEnded !== true && link !== undefined && link.watch === undefined;
+}
+
 function isStalePullRequestWatchStamp(
   projection: Pick<OrchestrationV2ThreadProjection, "thread" | "messages">,
   stamp: MonitorPullRequestStamp,
 ): boolean {
-  const link = threadPullRequestsOf(projection.thread).find(
-    (candidate) =>
-      candidate.source !== "stack-dismissed" && threadPullRequestKeysEqual(candidate, stamp),
-  );
+  const link = pullRequestWatchLink(projection.thread, stamp);
   if (link === undefined) return true;
   if (stamp.watchEnded === true) {
     // The final notice outlives its watch, but a replacement watch supersedes it.
@@ -1753,10 +1772,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
         const linkedItems = yield* snapshot.userItemsForMessages([command.messageId]);
         const baselineItems = yield* shownBaselineItems(snapshot, base.runs);
-        // Spares the maintenance-only history check a read of every user message: one
-        // non-maintenance item settles it, as in the full item list. Extra items of the thread
-        // never move modelSwitchSince's winner, whose evidence the baseline already holds.
-        const latestUserItem = yield* snapshot.latestUserItem;
+        // The broad read's highest user or error item floors nextTurnItemOrdinal. A
+        // non-maintenance user item also spares the maintenance-only history check a read of
+        // every user message. Extra items of the thread never move modelSwitchSince's winner,
+        // whose evidence the baseline already holds.
+        const latestItem = yield* snapshot.latestUserOrErrorItem;
         return toCommandProjection({
           ...base,
           attempts,
@@ -1766,7 +1786,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           turnItems: canonicalTurnItems([
             ...linkedItems,
             ...baselineItems,
-            ...(latestUserItem === undefined ? [] : [latestUserItem]),
+            ...(latestItem === undefined ? [] : [latestItem]),
           ]),
         });
       }),
@@ -1798,6 +1818,16 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         // The caller returns before reading anything else.
         if (thread.archivedAt !== null || thread.deletedAt !== null || seed.runs.some(isActiveRun)) {
           return seed;
+        }
+        // A pull-request wake of an ended watch is owed only if an earlier notice ended it.
+        if (
+          messages.some((message) =>
+            monitorPullRequestStamps(message.notification?.source).some((stamp) =>
+              pullRequestWakeReadsEndedWatchNotices(thread, stamp),
+            ),
+          )
+        ) {
+          return undefined;
         }
         const queued =
           focusRunId === undefined

@@ -505,7 +505,7 @@ const localIndexNames = [
   "local_projection_messages_compact_private_idx",
   "local_projection_attempts_live_private_idx",
   "local_projection_provider_turns_node_private_idx",
-  "local_projection_provider_turns_usage_now_private_idx",
+  "local_projection_provider_turns_usage_dated_private_idx",
   "local_projection_provider_turns_attempt_private_idx",
   "local_projection_checkpoints_window_private_idx",
   "local_projection_subagents_run_private_idx",

@@ -439,8 +439,11 @@ export interface ProjectionControlSnapshot {
   readonly userItemsForMessages: (
     messageIds: ReadonlyArray<MessageId>,
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2TurnItem>, ProjectionStoreV2Error>;
-  /** The thread's latest user item: two index seeks and one row. */
-  readonly latestUserItem: Effect.Effect<OrchestrationV2TurnItem | undefined, ProjectionStoreV2Error>;
+  /** The thread's latest user or error item: two covering seeks and one row. */
+  readonly latestUserOrErrorItem: Effect.Effect<
+    OrchestrationV2TurnItem | undefined,
+    ProjectionStoreV2Error
+  >;
   /** Attempts by ID and every attempt of the given runs. */
   readonly attempts: (input: {
     readonly attemptIds: ReadonlyArray<RunAttemptId>;
@@ -3617,18 +3620,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           recentRunIds === null
             ? sql``
             : sql`AND ${sql.literal(column)} IN (SELECT value FROM json_each(${recentRunIds}))`;
-        // julianday('now') is not deterministic, so the usage index leaves 'now' timestamps unkeyed;
-        // a thread holding one reads latest usage with main's unindexed query instead.
-        const usageNowFallback =
+        // The usage index keys only fixed dates. A thread with an unkeyed time that julianday still
+        // reads, such as 'now', reads latest usage with main's unindexed query instead.
+        const usageClockFallback =
           window === undefined &&
           filter?.latestProviderTurnUsageOnly === true &&
           (yield* sql<{ readonly found: number }>`
             SELECT 1 AS found FROM orchestration_v2_projection_provider_turns
-              INDEXED BY local_projection_provider_turns_usage_now_private_idx
+              INDEXED BY local_projection_provider_turns_usage_dated_private_idx
             WHERE thread_id = ${threadId} AND status <> 'local-index-private'
               AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL
-              AND (CASE WHEN json_valid(payload_json) AND lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) IS NOT 'now' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) IS NULL
-              AND (CASE WHEN json_valid(payload_json) THEN lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) = 'now'
+              AND (CASE WHEN json_valid(payload_json) AND substr(json_extract(payload_json, '$.tokenUsage.updatedAt'), 1, 1) BETWEEN '0' AND '9' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) IS NULL
+              AND (CASE WHEN json_valid(payload_json) THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) IS NOT NULL
             LIMIT 1
           `).length > 0;
         // Without the hint SQLite reads every row of the thread to find the recent runs' rows.
@@ -4176,9 +4179,9 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 filter?.runningProviderTurnsOnly === true
                   ? sql`INDEXED BY local_projection_provider_turns_live_idx`
                   : filter?.latestProviderTurnUsageOnly === true
-                    ? usageNowFallback
+                    ? usageClockFallback
                       ? sql``
-                      : sql`INDEXED BY local_projection_provider_turns_usage_now_private_idx`
+                      : sql`INDEXED BY local_projection_provider_turns_usage_dated_private_idx`
                     : filter?.providerTurnAttemptIds !== undefined || recentRunIds !== null
                       ? sql`INDEXED BY local_projection_provider_turns_attempt_private_idx`
                       : sql``
@@ -4203,13 +4206,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               ${filter?.providerTurnThreadIds === undefined ? sql`` : sql`AND provider_thread_id IN (SELECT value FROM json_each(${encodeIdList(filter.providerTurnThreadIds)}))`}
               ${
                 filter?.latestProviderTurnUsageOnly === true
-                  ? usageNowFallback
+                  ? usageClockFallback
                     ? sql`AND json_extract(payload_json, '$.tokenUsage') IS NOT NULL
             ORDER BY julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) DESC,
               provider_thread_id ASC, ordinal ASC
             LIMIT 1`
                     : sql`AND status <> 'local-index-private' AND (CASE WHEN json_valid(payload_json) THEN json_extract(payload_json, '$.tokenUsage') END) IS NOT NULL
-            ORDER BY (CASE WHEN json_valid(payload_json) AND lower(json_extract(payload_json, '$.tokenUsage.updatedAt')) IS NOT 'now' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
+            ORDER BY (CASE WHEN json_valid(payload_json) AND substr(json_extract(payload_json, '$.tokenUsage.updatedAt'), 1, 1) BETWEEN '0' AND '9' THEN julianday(json_extract(payload_json, '$.tokenUsage.updatedAt')) END) DESC,
               provider_thread_id ASC, ordinal ASC
             LIMIT 1`
                   : sql`ORDER BY provider_thread_id ASC, ordinal ASC`
@@ -6666,14 +6669,31 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 Effect.flatMap(decodeRows(decodeTurnItemPayload, threadId)),
                 Effect.mapError(controlReadError(threadId)),
               ),
-        latestUserItem: sql<PayloadRow>`
-          SELECT payload_json FROM orchestration_v2_projection_turn_items
-          WHERE rowid = (
-            SELECT rowid FROM orchestration_v2_projection_turn_items
-              INDEXED BY local_projection_turn_items_type_private_idx
-            WHERE thread_id = ${threadId} AND type = 'user_message'
-              AND type <> 'local-index-private'
-            ORDER BY ordinal DESC, turn_item_id DESC LIMIT 1)
+        latestUserOrErrorItem: sql<PayloadRow>`
+          WITH candidates AS MATERIALIZED (
+            SELECT * FROM (
+              SELECT rowid AS item_rowid, ordinal, turn_item_id
+              FROM orchestration_v2_projection_turn_items
+                INDEXED BY local_projection_turn_items_type_private_idx
+              WHERE thread_id = ${threadId} AND type = 'user_message'
+                AND type <> 'local-index-private'
+              ORDER BY ordinal DESC, turn_item_id DESC LIMIT 1
+            )
+            UNION ALL
+            SELECT * FROM (
+              SELECT rowid AS item_rowid, ordinal, turn_item_id
+              FROM orchestration_v2_projection_turn_items
+                INDEXED BY local_projection_turn_items_type_private_idx
+              WHERE thread_id = ${threadId} AND type = 'error'
+                AND type <> 'local-index-private'
+              ORDER BY ordinal DESC, turn_item_id DESC LIMIT 1
+            )
+          ), winner AS (
+            SELECT item_rowid FROM candidates ORDER BY ordinal DESC, turn_item_id DESC LIMIT 1
+          )
+          SELECT item.payload_json FROM winner
+          CROSS JOIN orchestration_v2_projection_turn_items AS item
+            ON item.rowid = winner.item_rowid
         `.pipe(
           Effect.flatMap(decodeRows(decodeTurnItemPayload, threadId)),
           Effect.map((items) => items[0]),
