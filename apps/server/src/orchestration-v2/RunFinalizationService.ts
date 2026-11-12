@@ -67,8 +67,9 @@ const make = Effect.gen(function* () {
           (cause) => new RunFinalizationError({ ...input, operation: "capture-checkpoint", cause }),
         ),
       );
+    // Local t3-code-nightly patch: only this scope's cwd is used, not the thread's checkpoint history.
     const projection = yield* projections
-      .getCheckpointContext(input.threadId)
+      .getCheckpointContext(input.threadId, input.scopeId)
       .pipe(
         Effect.mapError(
           (cause) => new RunFinalizationError({ ...input, operation: "refresh-workspace", cause }),

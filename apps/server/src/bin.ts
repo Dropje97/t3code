@@ -53,6 +53,11 @@ if (
   const launcherOptions = launcher?.parseServiceLauncherArgs(process.argv.slice(3));
   if (launcher !== undefined && launcherOptions !== undefined) {
     await launcher.runServiceLauncherCli(launcherOptions);
+  } else if (process.argv[2] === "__spawn-host") {
+    // Local t3-code-nightly patch: the Linux spawn host imports only Node builtins and skips the
+    // CLI graph, so its heap (and every fork it makes) stays small.
+    const { runSpawnHost } = await import("./process/spawnHostProcess.ts");
+    runSpawnHost();
   } else {
     const { runCliCommand } = await loadCliMain();
     await runCliCommand();

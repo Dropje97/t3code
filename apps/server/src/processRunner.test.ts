@@ -1,3 +1,10 @@
+// @effect-diagnostics nodeBuiltinImport:off - integration tests exercise real process IO.
+import * as NodeURL from "node:url";
+import * as NodeServices from "@effect/platform-node/NodeServices";
+import * as NodeChildProcessSpawner from "@effect/platform-node-shared/NodeChildProcessSpawner";
+import * as ChildProcess from "effect/process/ChildProcess";
+import * as Fiber from "effect/Fiber";
+import * as SpawnHost from "./process/SpawnHost.ts";
 import { isWindowsCommandNotFound } from "@t3tools/provider-core/server/snapshotProbe";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -273,4 +280,103 @@ describe("isWindowsCommandNotFound", () => {
       expect(isCommandNotFound).toBe(true);
     }),
   );
+});
+
+describe.skipIf(HostProcess.Platform.defaultValue() !== "linux")("real process IO", () => {
+  describe.each([false, true])("hosted=%s", (hosted) => {
+    const layer = ProcessRunner.layer.pipe(
+      Layer.provideMerge(
+        hosted
+          ? SpawnHost.layerHost(
+              process.execPath,
+              [NodeURL.fileURLToPath(new URL("./bin.ts", import.meta.url)), "__spawn-host"],
+              (failure) => {
+                throw failure.cause;
+              },
+            )
+          : NodeChildProcessSpawner.layer,
+      ),
+      Layer.provide(NodeServices.layer),
+    );
+    const run = (input: ProcessRunner.ProcessRunInput) =>
+      Effect.flatMap(ProcessRunner.ProcessRunner, (runner) => runner.run(input));
+    it.live("preserves large stdin, EOF, output order, stderr and exit code", () =>
+      Effect.gen(function* () {
+        const input = "0123456789abcdef\n".repeat(120_000);
+        const output = yield* run({
+          command: "sh",
+          args: ["-c", "cat; printf done >&2; exit 3"],
+          stdin: input,
+          maxOutputBytes: 4_000_000,
+        });
+        expect(output).toMatchObject({ stdout: input, stderr: "done", code: 3, timedOut: false });
+      }).pipe(Effect.provide(layer)),
+    );
+    it.live("retains immediate binary output and output produced before the first read", () =>
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        for (let i = 0; i < 30; i++) {
+          const handle = yield* spawner.spawn(
+            ChildProcess.make("sh", ["-c", "printf '\\000\\377hello'; printf error >&2"], {
+              stdin: "ignore",
+            }),
+          );
+          yield* handle.exitCode;
+          const bytes = yield* Stream.runCollect(handle.stdout);
+          expect(Buffer.concat([...bytes])).toEqual(Buffer.from([0, 255, ...Buffer.from("hello")]));
+          expect(yield* Stream.runCollect(Stream.decodeText(handle.stderr))).toEqual(["error"]);
+        }
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+    it.live("preserves ENOENT classification and bounds output", () =>
+      Effect.gen(function* () {
+        const error = yield* run({
+          command: "/definitely-missing-t3-spawn-test",
+          args: ["arg"],
+        }).pipe(Effect.flip);
+        expect(error._tag).toBe("ProcessSpawnError");
+        const limit = yield* run({ command: "yes", args: [], maxOutputBytes: 1000 }).pipe(
+          Effect.flip,
+        );
+        expect(limit._tag).toBe("ProcessOutputLimitError");
+        expect((yield* run({ command: "echo", args: ["after"] })).stdout).toBe("after\n");
+      }).pipe(Effect.provide(layer)),
+    );
+    it.live("kills the detached process group on timeout", () =>
+      Effect.gen(function* () {
+        const output = yield* run({
+          command: "sh",
+          args: ["-c", "sleep 30 & wait"],
+          timeout: "100 millis",
+          timeoutBehavior: "timedOutResult",
+        });
+        expect(output.timedOut).toBe(true);
+      }).pipe(Effect.provide(layer)),
+    );
+    it.live("supports extra duplex file descriptors and pipelines", () =>
+      Effect.gen(function* () {
+        const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
+        const handle = yield* spawner.spawn(
+          ChildProcess.make("sh", ["-c", "cat <&3 >&3"], {
+            additionalFds: { fd3: { type: "duplex" } },
+            stdin: "ignore",
+          }),
+        );
+        const writer = yield* Stream.run(
+          Stream.encodeText(Stream.make("fd payload")),
+          handle.getInputFd(3),
+        ).pipe(Effect.forkScoped);
+        const output = yield* Stream.runCollect(Stream.decodeText(handle.getOutputFd(3)));
+        yield* Fiber.join(writer);
+        expect(output.join("")).toBe("fd payload");
+        expect(yield* handle.exitCode).toBe(0);
+        const piped = yield* spawner.spawn(
+          ChildProcess.make("printf", ["hello"]).pipe(
+            ChildProcess.pipeTo(ChildProcess.make("cat")),
+          ),
+        );
+        expect((yield* Stream.runCollect(Stream.decodeText(piped.stdout))).join("")).toBe("hello");
+      }).pipe(Effect.scoped, Effect.provide(layer)),
+    );
+  });
 });

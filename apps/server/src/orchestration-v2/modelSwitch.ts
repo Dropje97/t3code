@@ -13,21 +13,25 @@ import { runRanAfter } from "@t3tools/shared/orchestrationV2ThreadError";
  * in when there is none, such as a fork's source run. Callers skip starts with a context handoff;
  * the handoff item already shows those.
  */
+/** Clients hide pending queued messages, fold async answers into their question, and replace
+ * `/compact` with a compaction row. */
+export function isShownUserItem(item: OrchestrationV2TurnItem): boolean {
+  return (
+    item.type === "user_message" &&
+    !(item.inputIntent === "queued_turn" && item.status === "pending") &&
+    !item.messageId.startsWith("async-answer:") &&
+    !isCompactionCommandMessage({ role: "user", ...item })
+  );
+}
+
 export function modelSwitchSince(
   projection: Pick<OrchestrationV2ThreadProjection, "runs" | "turnItems">,
   to: ModelSelection,
   baseline?: ModelSelection,
 ): Pick<Extract<OrchestrationV2TurnItem, { type: "user_message" }>, "modelSwitch"> {
-  // Clients hide pending queued messages, fold async answers into their question, and replace
-  // `/compact` with a compaction row.
   const shown = new Set(
     projection.turnItems.flatMap((item) =>
-      item.type === "user_message" &&
-      !(item.inputIntent === "queued_turn" && item.status === "pending") &&
-      !item.messageId.startsWith("async-answer:") &&
-      !isCompactionCommandMessage({ role: "user", ...item })
-        ? [item.messageId]
-        : [],
+      item.type === "user_message" && isShownUserItem(item) ? [item.messageId] : [],
     ),
   );
   let previous: OrchestrationV2ThreadProjection["runs"][number] | undefined;

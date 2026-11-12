@@ -228,6 +228,7 @@ const prepare = (sql, cached) => {
 };
 parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }) => {
   let operation = "open";
+  const startedAt = performance.now();
   try {
     if (db === undefined) throw new Error("database reader is unavailable");
     operation = "prepare";
@@ -236,10 +237,11 @@ parentPort.on("message", ({ id, sql, params, cached, values, raw, safeIntegers }
     statement.setReadBigInts(safeIntegers);
     if (statement.columns().length > 0) {
       statement.setReturnArrays(values);
-      parentPort.postMessage({ id, rows: statement.all(...params) });
+      const rows = statement.all(...params);
+      parentPort.postMessage({ id, rows, ms: performance.now() - startedAt });
     } else {
       const result = statement.run(...params);
-      parentPort.postMessage({ id, rows: raw ? result : [] });
+      parentPort.postMessage({ id, rows: raw ? result : [], ms: performance.now() - startedAt });
     }
   } catch (error) {
     parentPort.postMessage({
@@ -269,7 +271,7 @@ type ReaderStartup =
   | { readonly type: "unavailable"; readonly message: string };
 
 type ReaderReply =
-  | { readonly id: number; readonly rows: ReadonlyArray<any> }
+  | { readonly id: number; readonly rows: ReadonlyArray<any>; readonly ms?: number }
   | {
       readonly id: number;
       readonly error: {
@@ -280,6 +282,28 @@ type ReaderReply =
         readonly errstr?: unknown;
       };
     };
+
+// Local t3-code-nightly diagnostic: log reader statements that execute longer than this,
+// with the calling spans, to attribute reader saturation.
+const localSlowReadMs = Number(process.env.T3CODE_LOCAL_SLOW_READ_MS ?? 250);
+const localSpanChain = (fiber: unknown): string => {
+  const names: Array<string> = [];
+  let span: any = (fiber as { readonly currentSpanLocal?: unknown }).currentSpanLocal;
+  while (span !== undefined && names.length < 8) {
+    if (typeof span.name === "string") names.push(span.name);
+    span = span.parent?._tag === "Some" ? span.parent.value : undefined;
+  }
+  return names.join(" < ");
+};
+const logLocalSlowRead = (sql: string, reply: ReaderReply, sentAt: number, spans: string) => {
+  if (!("rows" in reply) || reply.ms === undefined || reply.ms < localSlowReadMs) return;
+  const total = performance.now() - sentAt;
+  const rows = Array.isArray(reply.rows) ? reply.rows.length : 0;
+  const fingerprint = sql.replace(/\s+/g, " ").trim().slice(0, 240);
+  process.stderr.write(
+    `[local-slow-read] exec=${Math.round(reply.ms)}ms wait=${Math.round(total - reply.ms)}ms rows=${rows} spans=${spans} sql=${fingerprint}\n`,
+  );
+};
 
 const readerFailureMessages = {
   open: "Failed to open database",
@@ -372,11 +396,14 @@ const makeReader = Effect.fnUntraced(function* (
               );
         }
         const safeIntegers = Boolean(Context.get(fiber.context, Client.SafeIntegers));
+        const spans = localSpanChain(fiber);
         return Effect.callback<ReadonlyArray<any>, SqlError>((resume) => {
           const id = nextRequestId++;
+          const sentAt = performance.now();
           pending.set(id, {
             endsTransaction,
             resume: (reply) => {
+              logLocalSlowRead(input.sql, reply, sentAt, spans);
               if ("rows" in reply) {
                 resume(Effect.succeed(reply.rows));
                 return;

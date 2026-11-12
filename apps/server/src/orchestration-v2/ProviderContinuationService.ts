@@ -130,15 +130,10 @@ export const layer = Layer.effectDiscard(
 
     const dispatchContinuation = Effect.fn("ProviderContinuationService.dispatchContinuation")(
       function* (request: ProviderContinuationRequests.ProviderContinuationRequest) {
-        const projection = yield* threads.getThreadRecords(
+        // Local t3-code-nightly patch: keyed records instead of every run and turn of the thread.
+        const projection = yield* threads.getProviderContinuationState(
           request.threadId,
-          ["messages", "runs", "providerTurns"],
-          {
-            messageIds:
-              request.delegatedCompletion === undefined
-                ? []
-                : [request.delegatedCompletion.messageId],
-          },
+          request.delegatedCompletion,
         );
         if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) {
           yield* Effect.logInfo("orchestration-v2.provider-continuation.thread-archived", {
@@ -306,15 +301,9 @@ export const layer = Layer.effectDiscard(
                 const retryDelay = yield* nextRetryDelay(retryKey);
                 yield* Effect.gen(function* () {
                   yield* Effect.sleep(`${retryDelay} millis`);
-                  const projection = yield* threads.getThreadRecords(
+                  const projection = yield* threads.getProviderContinuationState(
                     request.threadId,
-                    ["messages", "runs", "providerTurns"],
-                    {
-                      messageIds:
-                        request.delegatedCompletion === undefined
-                          ? []
-                          : [request.delegatedCompletion.messageId],
-                    },
+                    completion,
                   );
                   if (currentDelegatedCompletionDelivery(projection, completion) !== undefined) {
                     yield* requests.offer(request);

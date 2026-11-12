@@ -387,6 +387,7 @@ export interface ThreadManagementServiceShape {
     readonly itemId: TurnItemId;
   }) => Effect.Effect<OrchestrationV2GetTurnItemResult, Orchestrator.OrchestratorV2Error>;
   readonly getThreadRecords: Orchestrator.OrchestratorV2["Service"]["getThreadRecords"];
+  readonly getProviderContinuationState: Orchestrator.OrchestratorV2["Service"]["getProviderContinuationState"];
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, Orchestrator.OrchestratorV2Error>;
@@ -835,7 +836,11 @@ const make = Effect.gen(function* () {
   const sendToThread: ThreadManagementServiceShape["sendToThread"] = Effect.fn(
     "ThreadManagementService.sendToThread",
   )(function* (input) {
-    const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"]);
+    // Local t3-code-nightly patch: latestSteerableRun reads running runs and running turns only.
+    const target = yield* getProjectThreadRecords(input, ["runs", "providerTurns"], {
+      runStatuses: ["running"],
+      runningProviderTurnsOnly: true,
+    });
     if (target.thread.archivedAt !== null) {
       return yield* new ThreadManagementThreadArchivedError({
         threadId: input.threadId,
@@ -1629,6 +1634,13 @@ const make = Effect.gen(function* () {
       function (threadId, fields, filter) {
         return ensureProjectionTranscript(threadId).pipe(
           Effect.andThen(orchestrator.getThreadRecords(threadId, fields, filter)),
+        );
+      },
+    ),
+    getProviderContinuationState: Effect.fn("ThreadManagementService.getProviderContinuationState")(
+      function (threadId, delegatedCompletion) {
+        return ensureProjectionTranscript(threadId).pipe(
+          Effect.andThen(orchestrator.getProviderContinuationState(threadId, delegatedCompletion)),
         );
       },
     ),

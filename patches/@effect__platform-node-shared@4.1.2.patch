@@ -1,0 +1,247 @@
+diff --git a/src/NodeChildProcessSpawner.ts b/src/NodeChildProcessSpawner.ts
+--- a/src/NodeChildProcessSpawner.ts
++++ b/src/NodeChildProcessSpawner.ts
+@@ -56,7 +56,7 @@
+ import * as Sink from "effect/Sink"
+ import * as Stream from "effect/Stream"
+ import * as NodeChildProcess from "node:child_process"
+-import { PassThrough, type Writable } from "node:stream"
++import { PassThrough, type Readable, type Writable } from "node:stream"
+ import { buildSpawnOptions } from "./internal/nodeChildProcessSpawner.ts"
+ import { handleErrnoException } from "./internal/utils.ts"
+ import * as NodeSink from "./NodeSink.ts"
+@@ -111,7 +111,7 @@
+ }
+ 
+ /** Node has recorded the leader's exit, after which its PID may be reused by an unrelated process. */
+-const hasExited = (childProcess: NodeChildProcess.ChildProcess): boolean =>
++const hasExited = (childProcess: SpawnedChildProcess): boolean =>
+   childProcess.exitCode !== null || childProcess.signalCode !== null
+ 
+ /**
+@@ -120,7 +120,7 @@
+  */
+ const ownsProcessGroup = (
+   command: ChildProcess.StandardCommand,
+-  childProcess: NodeChildProcess.ChildProcess
++  childProcess: SpawnedChildProcess
+ ): boolean => command.options.detached !== false || !hasExited(childProcess)
+ 
+ /**
+@@ -133,7 +133,7 @@
+ /** The leader has not exited, or a member of its process group still exists. */
+ const isProcessAlive = (
+   command: ChildProcess.StandardCommand,
+-  childProcess: NodeChildProcess.ChildProcess
++  childProcess: SpawnedChildProcess
+ ): boolean => {
+   if (!hasExited(childProcess)) {
+     return true
+@@ -150,7 +150,7 @@
+ }
+ 
+ const taskkill = (
+-  childProcess: NodeChildProcess.ChildProcess,
++  childProcess: SpawnedChildProcess,
+   onExit: (error: NodeChildProcess.ExecException | null) => void = () => {}
+ ) => {
+   if (hasExited(childProcess)) {
+@@ -165,7 +165,22 @@
+   )
+ }
+ 
+-const make = Effect.gen(function*() {
++export interface SpawnedChildProcess extends NodeJS.EventEmitter {
++  readonly pid?: number | undefined
++  readonly exitCode: number | null
++  readonly signalCode: NodeJS.Signals | null
++  readonly stdin: Writable | null
++  readonly stdout: Readable | null
++  readonly stderr: Readable | null
++  readonly stdio: ReadonlyArray<Readable | Writable | null | undefined>
++  kill(signal?: NodeJS.Signals | number): boolean
++  ref(): void
++  unref(): void
++}
++
++type SpawnProcess = (command: string, args: ReadonlyArray<string>, options: NodeChildProcess.SpawnOptions) => SpawnedChildProcess
++
++const makeWithSpawn = (spawnProcess: SpawnProcess) => Effect.gen(function*() {
+   const fs = yield* FileSystem.FileSystem
+   const path = yield* Path.Path
+ 
+@@ -293,7 +308,7 @@
+ 
+   const setupAdditionalFds = Effect.fnUntraced(function*(
+     command: ChildProcess.StandardCommand,
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     additionalFds: ReadonlyArray<ResolvedAdditionalFd>,
+     inputFailure: Deferred.Deferred<never, PlatformError.PlatformError>
+   ) {
+@@ -309,7 +324,7 @@
+ 
+     const setupInput = (
+       fd: number,
+-      nodeStream: NodeChildProcess.ChildProcess["stdio"][number],
++      nodeStream: SpawnedChildProcess["stdio"][number],
+       stream: Stream.Stream<Uint8Array, PlatformError.PlatformError> | undefined
+     ) =>
+       Effect.suspend(() => {
+@@ -334,7 +349,7 @@
+ 
+     const setupOutput = (
+       fd: number,
+-      nodeStream: NodeChildProcess.ChildProcess["stdio"][number],
++      nodeStream: SpawnedChildProcess["stdio"][number],
+       sink: Sink.Sink<Uint8Array, Uint8Array, never, PlatformError.PlatformError> | undefined
+     ) => {
+       let stream: Stream.Stream<Uint8Array, PlatformError.PlatformError> = Stream.empty
+@@ -395,7 +410,7 @@
+ 
+   const setupChildStdin = (
+     command: ChildProcess.StandardCommand,
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     config: ChildProcess.StdinConfig,
+     inputFailure: Deferred.Deferred<never, PlatformError.PlatformError>
+   ) =>
+@@ -423,7 +438,7 @@
+ 
+   const setupChildOutputStreams = (
+     command: ChildProcess.StandardCommand,
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     stdoutConfig: ChildProcess.StdoutConfig,
+     stderrConfig: ChildProcess.StderrConfig
+   ): {
+@@ -471,11 +486,11 @@
+     spawnOptions: NodeChildProcess.SpawnOptions
+   ) =>
+     Effect.callback<
+-      readonly [NodeChildProcess.ChildProcess, ExitSignal],
++      readonly [SpawnedChildProcess, ExitSignal],
+       PlatformError.PlatformError
+     >((resume) => {
+       const deferred = Deferred.makeUnsafe<ExitCodeWithSignal>()
+-      const handle = NodeChildProcess.spawn(
++      const handle = spawnProcess(
+         command.command,
+         command.args.map(unwrap),
+         spawnOptions
+@@ -502,7 +517,7 @@
+ 
+   const killProcessGroup = (
+     command: ChildProcess.StandardCommand,
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     signal: NodeJS.Signals
+   ) => {
+     if (globalThis.process.platform === "win32") {
+@@ -525,7 +540,7 @@
+   }
+ 
+   const killProcessGroupOnExit = (
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     signal: NodeJS.Signals
+   ): void => {
+     if (globalThis.process.platform === "win32") {
+@@ -542,7 +557,7 @@
+ 
+   const killProcess = (
+     command: ChildProcess.StandardCommand,
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     signal: NodeJS.Signals
+   ) =>
+     Effect.suspend(() => {
+@@ -557,7 +572,7 @@
+   /** Waits for the leader and its process group, bounded by native time. */
+   const awaitProcessExit = (
+     command: ChildProcess.StandardCommand,
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     timeoutMillis: number
+   ): Effect.Effect<void> =>
+     Effect.callback<void>((resume) => {
+@@ -583,7 +598,7 @@
+ 
+   const terminateProcessGroup = Effect.fnUntraced(function*(
+     command: ChildProcess.StandardCommand,
+-    childProcess: NodeChildProcess.ChildProcess,
++    childProcess: SpawnedChildProcess,
+     exitSignal: ExitSignal,
+     options: ChildProcess.KillOptions | undefined
+   ) {
+@@ -862,7 +877,10 @@
+   ChildProcessSpawner,
+   never,
+   FileSystem.FileSystem | Path.Path
+-> = Layer.effect(ChildProcessSpawner, make)
++> = Layer.effect(ChildProcessSpawner, makeWithSpawn(NodeChildProcess.spawn))
++
++export const layerWithSpawn = (spawnProcess: SpawnProcess) =>
++  Layer.effect(ChildProcessSpawner, makeWithSpawn(spawnProcess))
+ 
+ // =============================================================================
+ // Internal Helpers
+diff --git a/dist/NodeChildProcessSpawner.js b/dist/NodeChildProcessSpawner.js
+--- a/dist/NodeChildProcessSpawner.js
++++ b/dist/NodeChildProcessSpawner.js
+@@ -90,7 +90,7 @@
+     windowsHide: true
+   }, onExit);
+ };
+-const make = /*#__PURE__*/Effect.gen(function* () {
++const makeWithSpawn = spawnProcess => Effect.gen(function* () {
+   const fs = yield* FileSystem.FileSystem;
+   const path = yield* Path.Path;
+   const resolveWorkingDirectory = Effect.fnUntraced(function* (options) {
+@@ -335,7 +335,7 @@
+   };
+   const spawn = (command, spawnOptions) => Effect.callback(resume => {
+     const deferred = Deferred.makeUnsafe();
+-    const handle = NodeChildProcess.spawn(command.command, command.args.map(unwrap), spawnOptions);
++    const handle = spawnProcess(command.command, command.args.map(unwrap), spawnOptions);
+     handle.on("error", error => {
+       // Node copies the arguments into `spawnargs`.
+       if (command.args.some(Redacted.isRedacted)) {
+@@ -665,7 +665,8 @@
+  * @category layers
+  * @since 4.0.0
+  */
+-export const layer = /*#__PURE__*/Layer.effect(ChildProcessSpawner, make);
++export const layer = /*#__PURE__*/Layer.effect(ChildProcessSpawner, makeWithSpawn(NodeChildProcess.spawn));
++export const layerWithSpawn = spawnProcess => Layer.effect(ChildProcessSpawner, makeWithSpawn(spawnProcess));
+ /**
+  * Flattens a `Command` into an array of `StandardCommand`s along with pipe
+  * options for each connection.
+diff --git a/dist/NodeChildProcessSpawner.d.ts b/dist/NodeChildProcessSpawner.d.ts
+--- a/dist/NodeChildProcessSpawner.d.ts
++++ b/dist/NodeChildProcessSpawner.d.ts
+@@ -37,6 +37,24 @@
+ import * as Path from "effect/Path";
+ import * as ChildProcess from "effect/process/ChildProcess";
+ import { ChildProcessSpawner } from "effect/process/ChildProcessSpawner";
++import type * as NodeChildProcess from "node:child_process";
++import type { Readable, Writable } from "node:stream";
++export interface SpawnedChildProcess extends NodeJS.EventEmitter {
++  readonly pid?: number | undefined
++  readonly exitCode: number | null
++  readonly signalCode: NodeJS.Signals | null
++  readonly stdin: Writable | null
++  readonly stdout: Readable | null
++  readonly stderr: Readable | null
++  readonly stdio: ReadonlyArray<Readable | Writable | null | undefined>
++  kill(signal?: NodeJS.Signals | number): boolean
++  ref(): void
++  unref(): void
++}
++
++type SpawnProcess = (command: string, args: ReadonlyArray<string>, options: NodeChildProcess.SpawnOptions) => SpawnedChildProcess
++
++export declare const layerWithSpawn: (spawnProcess: SpawnProcess) => Layer.Layer<ChildProcessSpawner, never, FileSystem.FileSystem | Path.Path>;
+ /**
+  * Layer that provides the `NodeChildProcessSpawner` implementation.
+  *
