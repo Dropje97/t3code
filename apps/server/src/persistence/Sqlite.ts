@@ -215,18 +215,23 @@ const setupLocalReadIndexes = Effect.gen(function* () {
   WHERE type = 'subagent' AND type <> 'local-index-private'`;
 });
 
-// CLI commands open the server's database from another process; migrating behind its owner changes the schema it runs on.
-const runMigrationsAsOwner = Effect.fn("SqlitePersistence.runMigrationsAsOwner")(function* () {
+const hasPendingLocalSchema = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
-  const pendingMigrations = yield* hasPendingMigrations();
   const installed = yield* sql<{ readonly name: string }>`
     SELECT name FROM sqlite_schema
     WHERE name IN ${sql.in([...LOCAL_READ_INDEX_NAMES, ...OBSOLETE_LOCAL_SCHEMA_NAMES])}
   `;
   const names = new Set(installed.map((row) => row.name));
-  const localSchemaPending =
+  return (
     LOCAL_READ_INDEX_NAMES.some((name) => !names.has(name)) ||
-    OBSOLETE_LOCAL_SCHEMA_NAMES.some((name) => names.has(name));
+    OBSOLETE_LOCAL_SCHEMA_NAMES.some((name) => names.has(name))
+  );
+});
+
+// CLI commands open the server's database from another process; migrating behind its owner changes the schema it runs on.
+const runMigrationsAsOwner = Effect.fn("SqlitePersistence.runMigrationsAsOwner")(function* () {
+  const pendingMigrations = yield* hasPendingMigrations();
+  const localSchemaPending = yield* hasPendingLocalSchema;
   if (!pendingMigrations && !localSchemaPending) return yield* runMigrations();
   const { serverRuntimeStatePath } = yield* ServerConfig.ServerConfig;
   yield* ServerOwnership.holdServerOwnershipLock(serverRuntimeStatePath).pipe(
@@ -242,19 +247,22 @@ const runMigrationsAsOwner = Effect.fn("SqlitePersistence.runMigrationsAsOwner")
 // Index builds over large tables take minutes; on the main connection they block the event loop,
 // so requests hang instead of getting the listener's 503. A fresh database stays on the main
 // connection, which must create the first table for its auto_vacuum setting to apply.
+// Local t3-code-nightly patch: local read indexes install here too.
 const runMigrationsOffMainThread = Effect.fn("SqlitePersistence.runMigrationsOffMainThread")(
   function* (dbPath: string) {
     const sql = yield* SqlClient.SqlClient;
     const tables = yield* sql<{
       readonly count: number;
     }>`SELECT COUNT(*) AS count FROM sqlite_schema WHERE type = 'table'`;
-    if (!tables[0]?.count || !(yield* hasPendingMigrations())) return yield* runMigrations();
+    const migrate = runMigrations().pipe(Effect.andThen(setupLocalReadIndexes));
+    if (!tables[0]?.count || (!(yield* hasPendingMigrations()) && !(yield* hasPendingLocalSchema)))
+      return yield* migrate;
     return yield* Effect.gen(function* () {
       const worker = yield* SqlClient.SqlClient;
       yield* worker`PRAGMA foreign_keys = ON;`;
       yield* worker`PRAGMA synchronous = NORMAL;`;
       yield* worker`PRAGMA temp_store = MEMORY;`;
-      return yield* runMigrations();
+      return yield* migrate;
     }).pipe(Effect.provide(NodeSqliteClient.layerWorker(dbPath)));
   },
 );

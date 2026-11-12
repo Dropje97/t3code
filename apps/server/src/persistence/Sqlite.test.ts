@@ -540,6 +540,48 @@ it("keeps the deployed definitions of retained local indexes", () => {
   }
 });
 
+// Local t3-code-nightly patch: a server start with no pending upstream migration still installs
+// missing local indexes, on a read-write worker like the migrations.
+it.effect(
+  "installs missing local indexes on a worker when no upstream migration is pending",
+  () => {
+    const tempDir = NodeFS.mkdtempSync(NodePath.join(NodeOS.tmpdir(), "t3-sqlite-local-only-"));
+    const dbPath = NodePath.join(tempDir, "state.sqlite");
+
+    return Effect.gen(function* () {
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        yield* sql`PRAGMA journal_mode = WAL;`;
+        yield* runMigrations();
+      }).pipe(Effect.provide(NodeSqliteClient.layer({ filename: dbPath })));
+      const startedBefore = workerData.length;
+
+      yield* Effect.gen(function* () {
+        const sql = yield* SqlClient.SqlClient;
+        const localIndexes = yield* sql<{ readonly name: string }>`
+        SELECT name FROM sqlite_schema WHERE type = 'index' AND name GLOB 'local_projection_*' ORDER BY name
+      `;
+        assert.deepEqual(
+          localIndexes.map((row) => row.name),
+          localIndexNames.toSorted(),
+        );
+      }).pipe(
+        Effect.provide(
+          SqlitePersistence.layerFromPath(dbPath).pipe(Layer.provide(NodeServices.layer)),
+        ),
+      );
+      assert.deepInclude(workerData.slice(startedBefore), {
+        filename: dbPath,
+        readOnly: false,
+        allowExtension: false,
+        prepareCacheSize: 200,
+      });
+    }).pipe(
+      Effect.ensuring(Effect.sync(() => NodeFS.rmSync(tempDir, { recursive: true, force: true }))),
+    );
+  },
+);
+
 it.effect(
   "replaces the deployed local schema after upstream migrations and remains idempotent",
   () => {
