@@ -45,7 +45,6 @@ import type {
   GuestShareId,
   ProviderThreadId,
   ProviderTurnId,
-  RunAttemptId,
 } from "@t3tools/contracts";
 import {
   IDLE_COMPACTION_TEXT,
@@ -74,6 +73,7 @@ import {
   CheckpointId,
   ThreadId,
   TurnItemId,
+  RunAttemptId,
   NodeId,
   ProjectId,
   ProviderInstanceId,
@@ -439,6 +439,8 @@ export interface ProjectionControlSnapshot {
   readonly userItemsForMessages: (
     messageIds: ReadonlyArray<MessageId>,
   ) => Effect.Effect<ReadonlyArray<OrchestrationV2TurnItem>, ProjectionStoreV2Error>;
+  /** The thread's latest user item: two index seeks and one row. */
+  readonly latestUserItem: Effect.Effect<OrchestrationV2TurnItem | undefined, ProjectionStoreV2Error>;
   /** Attempts by ID and every attempt of the given runs. */
   readonly attempts: (input: {
     readonly attemptIds: ReadonlyArray<RunAttemptId>;
@@ -6664,6 +6666,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 Effect.flatMap(decodeRows(decodeTurnItemPayload, threadId)),
                 Effect.mapError(controlReadError(threadId)),
               ),
+        latestUserItem: sql<PayloadRow>`
+          SELECT payload_json FROM orchestration_v2_projection_turn_items
+          WHERE rowid = (
+            SELECT rowid FROM orchestration_v2_projection_turn_items
+              INDEXED BY local_projection_turn_items_type_private_idx
+            WHERE thread_id = ${threadId} AND type = 'user_message'
+              AND type <> 'local-index-private'
+            ORDER BY ordinal DESC, turn_item_id DESC LIMIT 1)
+        `.pipe(
+          Effect.flatMap(decodeRows(decodeTurnItemPayload, threadId)),
+          Effect.map((items) => items[0]),
+          Effect.mapError(controlReadError(threadId)),
+        ),
         attempts: ({ attemptIds, runIds }) =>
           attemptIds.length === 0 && runIds.length === 0
             ? Effect.succeed([])
@@ -6922,7 +6937,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
      */
     const readTimelineWindow = Effect.fn("ProjectionStore.readTimelineWindow")(function* (
       threadId: ThreadId,
-      runs: ProjectionRecords<"runs">["runs"],
+      runs: ReadonlyArray<Pick<OrchestrationV2Run, "id" | "status">>,
       includePersistentOutput: boolean,
       where: Statement.Fragment,
       limit: Statement.Fragment = sql``,
@@ -6990,6 +7005,41 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
     });
 
     /**
+     * Local t3-code-nightly patch: the run and attempt columns a timeline window reads, from
+     * covering indexes. Every run and attempt payload of a 7k-run thread takes 2.5 s per page.
+     */
+    const readTimelineMetadata = Effect.fn("ProjectionStore.readTimelineMetadata")(function* (
+      threadId: ThreadId,
+    ) {
+      const { thread } = yield* getThreadRecords(threadId, []);
+      const runs = yield* sql<{ run_id: string; status: OrchestrationV2Run["status"] }>`
+        SELECT run_id, status FROM orchestration_v2_projection_runs
+          INDEXED BY local_projection_runs_timeline_metadata_private_idx
+        WHERE thread_id = ${threadId} AND status <> 'local-index-private'
+        ORDER BY ordinal ASC`;
+      const attempts = yield* sql<{
+        attempt_id: string;
+        run_id: string;
+        root_node_id: string;
+        status: ProjectionRecords<"attempts">["attempts"][number]["status"];
+      }>`
+        SELECT attempt_id, run_id, root_node_id, status FROM orchestration_v2_projection_run_attempts
+          INDEXED BY local_projection_attempts_timeline_metadata_ids_private_idx
+        WHERE thread_id = ${threadId} AND status <> 'local-index-private'
+        ORDER BY run_id ASC, attempt_ordinal ASC`;
+      return {
+        thread,
+        runs: runs.map((row) => ({ id: RunId.make(row.run_id), status: row.status })),
+        attempts: attempts.map((row) => ({
+          id: RunAttemptId.make(row.attempt_id),
+          runId: RunId.make(row.run_id),
+          rootNodeId: NodeId.make(row.root_node_id),
+          status: row.status,
+        })),
+      };
+    });
+
+    /**
      * Reads parts of a thread's own timeline without indexing all of it. Null when callers read
      * the full index instead: the thread shows fork ancestry, so its rows come from other threads,
      * or a full index of this snapshot is cached already.
@@ -7015,7 +7065,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           AND NOT (json_extract(payload_json, '$.forkedFrom.type') IS 'run'
             AND json_extract(payload_json, '$.lineage.sideChat') IS NOT 1)`;
       if (ownRowsOnly.length === 0) return null;
-      const records = yield* getThreadRecords(threadId, ["runs", "attempts"]);
+      const records = yield* readTimelineMetadata(threadId);
       if (inheritedRunFork(records.thread) !== null) return null;
       const superseded = records.attempts.filter((attempt) => attempt.status === "superseded");
       const stopRequests =

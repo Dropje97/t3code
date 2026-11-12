@@ -601,10 +601,8 @@ it.effect.each(cases)("preserves complete message dispatch transcript: %s", (tes
         "auto-waiting",
         "explicit-foreign",
         "explicit-missing",
-        "explicit-preparing",
         "restart-null-root",
         "steer-maintenance",
-        "steer-null-attempt",
         "steer-stop-reached",
         "steer-unsupported",
       ].includes(testCase);
@@ -750,8 +748,10 @@ it.effect.each(["lower-user", "move-error", "irrelevant-assistant-maximum"] as c
           (item) => item.type === "user_message" && item.messageId === "race-message",
         );
         assert.ok(newItem);
+        // Main keeps a moved user item's floor; a moved error item is not in its item read.
         // Stored sink allocation may rebase ordinals; inspect the pre-commit event as well.
-        assert.include(JSON.stringify(capture.snapshot()), '"ordinal":901');
+        if (testCase !== "move-error")
+          assert.include(JSON.stringify(capture.snapshot()), '"ordinal":901');
         expect(capture.snapshot()).toMatchSnapshot();
       }).pipe(
         Effect.ensuring(Effect.all([capture.stop, Effect.sync(() => nextSpy.mockRestore())])),

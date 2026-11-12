@@ -1753,13 +1753,21 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         });
         const linkedItems = yield* snapshot.userItemsForMessages([command.messageId]);
         const baselineItems = yield* shownBaselineItems(snapshot, base.runs);
+        // Spares the maintenance-only history check a read of every user message: one
+        // non-maintenance item settles it, as in the full item list. Extra items of the thread
+        // never move modelSwitchSince's winner, whose evidence the baseline already holds.
+        const latestUserItem = yield* snapshot.latestUserItem;
         return toCommandProjection({
           ...base,
           attempts,
           nodes,
           providerTurns,
           messages,
-          turnItems: canonicalTurnItems([...linkedItems, ...baselineItems]),
+          turnItems: canonicalTurnItems([
+            ...linkedItems,
+            ...baselineItems,
+            ...(latestUserItem === undefined ? [] : [latestUserItem]),
+          ]),
         });
       }),
     );
